@@ -8,9 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     print(ROOT)
-    # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
-    # 改进不要加载预训练权重
-    model = YOLO(ROOT / "/mnt/workspace/yolov8-mini/mini-yolov8/ultralytics/cfg/models/v8/yolov11.yaml") 
+    model = YOLO(ROOT / "ultralytics/cfg/models/v8/yolov8.yaml") # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
     results = model.train(
         data=ROOT / "datasets/data.yaml",  # 数据集配置文件路径
         epochs=100,  # 训练轮数
