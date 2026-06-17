@@ -227,6 +227,7 @@ CFG_BOOL_KEYS = frozenset(
         "simplify",
         "nms",
         "profile",
+        "minority_oversample",
         "end2end",
     }
 )

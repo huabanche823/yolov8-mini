@@ -95,6 +95,9 @@ class DetectionTrainer(BaseTrainer):
         if getattr(dataset, "rect", False) and shuffle and not np.all(dataset.batch_shapes == dataset.batch_shapes[0]):
             LOGGER.warning("'rect=True' is incompatible with DataLoader shuffle, setting shuffle=False")
             shuffle = False
+        sampler_weights = self.get_minority_sampler_weights(dataset) if mode == "train" else None
+        if sampler_weights is not None:
+            shuffle = False
         return build_dataloader(
             dataset,
             batch=batch_size,
@@ -102,7 +105,31 @@ class DetectionTrainer(BaseTrainer):
             shuffle=shuffle,
             rank=rank,
             drop_last=self.args.compile and mode == "train",
+            sampler_weights=sampler_weights,
         )
+
+    def get_minority_sampler_weights(self, dataset) -> list[float] | None:
+        """Return per-image weights for online oversampling of minority classes."""
+        if not self.args.minority_oversample:
+            return None
+
+        minority_weights = {1: 2.0, 4: 3.0, 5: 2.0}  # Glass_Bottle, Canister, Cans
+        weights = []
+        boosted = 0
+
+        for label in dataset.labels:
+            classes = label["cls"].reshape(-1).astype(int).tolist()
+            image_weight = 1.0
+            for cls in classes:
+                image_weight = max(image_weight, minority_weights.get(cls, 1.0))
+            boosted += image_weight > 1.0
+            weights.append(image_weight)
+
+        LOGGER.info(
+            f"Minority oversampling enabled: boosted {boosted}/{len(weights)} train images "
+            f"with class weights {minority_weights}"
+        )
+        return weights
 
     def preprocess_batch(self, batch: dict) -> dict:
         """Preprocess a batch of images by scaling and converting to float.

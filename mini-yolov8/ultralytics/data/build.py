@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image
-from torch.utils.data import Dataset, dataloader, distributed
+from torch.utils.data import Dataset, WeightedRandomSampler, dataloader, distributed
 
 from ultralytics.cfg import IterableSimpleNamespace
 from ultralytics.data.dataset import (
@@ -314,6 +314,7 @@ def build_dataloader(
     rank: int = -1,
     drop_last: bool = False,
     pin_memory: bool = True,
+    sampler_weights: list[float] | None = None,
 ) -> InfiniteDataLoader:
     """Create and return an InfiniteDataLoader for training or validation.
 
@@ -325,6 +326,7 @@ def build_dataloader(
         rank (int, optional): Process rank in distributed training. -1 for single-GPU training.
         drop_last (bool, optional): Whether to drop the last incomplete batch.
         pin_memory (bool, optional): Whether to use pinned memory for dataloader.
+        sampler_weights (list[float], optional): Per-image weights for online weighted sampling.
 
     Returns:
         (InfiniteDataLoader): A dataloader that can be used for training or validation.
@@ -337,13 +339,23 @@ def build_dataloader(
     batch = min(batch, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min(os.cpu_count() // max(nd, 1), workers)  # number of workers
-    sampler = (
-        None
-        if rank == -1
-        else distributed.DistributedSampler(dataset, shuffle=shuffle)
-        if shuffle
-        else ContiguousDistributedSampler(dataset)
-    )
+    if sampler_weights is not None:
+        if rank != -1:
+            raise NotImplementedError("Weighted minority oversampling currently supports single-GPU training only.")
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sampler_weights, dtype=torch.double),
+            num_samples=len(sampler_weights),
+            replacement=True,
+        )
+        shuffle = False
+    else:
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if shuffle
+            else ContiguousDistributedSampler(dataset)
+        )
     generator = torch.Generator()
     generator.manual_seed(6148914691236517205 + RANK)
     return InfiniteDataLoader(

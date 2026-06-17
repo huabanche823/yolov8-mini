@@ -1,13 +1,18 @@
 from pathlib import Path
-
-from ultralytics import YOLO
-
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import ultralytics  # noqa: E402
+from ultralytics import YOLO  # noqa: E402
+
 
 
 def main():
     print(ROOT)
+    print(f"ultralytics source: {ultralytics.__file__}")
     # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
     # 改进不要加载预训练权重
     model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11.yaml") 
@@ -28,7 +33,16 @@ def main():
         plots=True,  # 生成训练图表
         verbose=True, # 关闭详细日志输出
         amp=False,
-        optimizer="Adam"
+        optimizer="Adam",
+        mosaic=1.0,
+        close_mosaic=10,
+        mixup=0.0,
+        hsv_h=0.0,
+        hsv_s=0.0,
+        hsv_v=0.0,
+        multi_scale=0.0,
+        cls_pw=0.5,
+        minority_oversample=True,
     )
     print(f"train_ok task={model.task} save_dir={results.save_dir}")
 
