@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 # dataset
-dataset/
+datasets/
 
 # markdown pdf sh pt ultralytics
 *.md
