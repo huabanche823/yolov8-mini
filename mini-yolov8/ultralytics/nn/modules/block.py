@@ -37,6 +37,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_EMA",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -1105,6 +1106,75 @@ class C3k2(C2f):
             else Bottleneck(self.c, self.c, shortcut, g)
             for _ in range(n)
         )
+
+
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention for lightweight spatial-channel feature calibration."""
+
+    def __init__(self, channels: int, factor: int = 8):
+        """Initialize EMA attention.
+
+        Args:
+            channels (int): Number of input and output channels.
+            factor (int): Maximum channel grouping factor.
+        """
+        super().__init__()
+        self.groups = max(1, min(factor, channels))
+        while channels % self.groups != 0:
+            self.groups -= 1
+        group_channels = channels // self.groups
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(group_channels, group_channels)
+        self.conv1x1 = nn.Conv2d(group_channels, group_channels, 1, 1, 0)
+        self.conv3x3 = nn.Conv2d(group_channels, group_channels, 3, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply grouped multi-scale attention to the input feature map."""
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
+
+
+class C3k2_EMA(C3k2):
+    """C3k2 block enhanced with Efficient Multi-scale Attention."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        factor: int = 8,
+    ):
+        """Initialize C3k2_EMA module with the same arguments as C3k2 plus EMA grouping factor."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.ema = EMA(c2, factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C3k2 followed by EMA feature recalibration."""
+        return self.ema(super().forward(x))
+
+    def forward_split(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using split instead of chunk."""
+        return self.ema(super().forward_split(x))
 
 
 class MFAMBottleneck(nn.Module):
