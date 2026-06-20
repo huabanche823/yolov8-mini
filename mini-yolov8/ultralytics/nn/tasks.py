@@ -55,6 +55,7 @@ from ultralytics.nn.modules import (
     ImagePoolingAttn,
     Index,
     LRPCHead,
+    MFAM,
     Pose,
     Pose26,
     RepC3,
@@ -1707,6 +1708,7 @@ def parse_model(d, ch, verbose=True):
             PSA,
             SCDown,
             C2fCIB,
+            MFAM,
             A2C2f,
         }
     )
@@ -1726,6 +1728,7 @@ def parse_model(d, ch, verbose=True):
             C2fPSA,
             C2fCIB,
             C2PSA,
+            MFAM,
             A2C2f,
         }
     )

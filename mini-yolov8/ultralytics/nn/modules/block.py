@@ -45,6 +45,7 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "MFAM",
     "Proto",
     "RepC3",
     "RepNCSPELAN4",
@@ -1104,6 +1105,57 @@ class C3k2(C2f):
             else Bottleneck(self.c, self.c, shortcut, g)
             for _ in range(n)
         )
+
+
+class MFAMBottleneck(nn.Module):
+    """Multi-scale feature aggregation bottleneck for small-object feature enhancement."""
+
+    def __init__(self, c: int, shortcut: bool = True):
+        """Initialize a lightweight multi-scale aggregation block.
+
+        Args:
+            c (int): Input and output channels.
+            shortcut (bool): Whether to add a residual connection.
+        """
+        super().__init__()
+        self.cv1 = Conv(c, c, 1, 1)
+        self.branch3 = DWConv(c, c, 3, 1)
+        self.branch5 = DWConv(c, c, 5, 1)
+        self.branch7 = DWConv(c, c, 7, 1)
+        self.cv2 = Conv(3 * c, c, 1, 1)
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Aggregate 3x3, 5x5 and 7x7 receptive-field features."""
+        y = self.cv1(x)
+        y = self.cv2(torch.cat((self.branch3(y), self.branch5(y), self.branch7(y)), 1))
+        return x + y if self.add else y
+
+
+class MFAM(nn.Module):
+    """C2f-style Multi-scale Feature Aggregation Module for YOLO neck feature fusion."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, e: float = 0.5):
+        """Initialize MFAM.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of MFAM bottlenecks.
+            shortcut (bool): Whether MFAM bottlenecks use residual connections.
+            e (float): Hidden channel expansion ratio.
+        """
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(MFAMBottleneck(self.c, shortcut) for _ in range(n))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through MFAM."""
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.m)
+        return self.cv2(torch.cat(y, 1))
 
 
 class C3k(C3):
