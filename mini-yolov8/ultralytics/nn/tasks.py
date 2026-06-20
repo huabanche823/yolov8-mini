@@ -28,6 +28,7 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    ASFF2,
     Bottleneck,
     BottleneckCSP,
     C2f,
@@ -46,6 +47,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    DLU,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -1772,6 +1774,13 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is DLU:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is ASFF2:
+            c1 = [ch[x] for x in f]
+            args = [c1, *args]
+            c2 = sum(c1)
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

@@ -28,6 +28,7 @@ __all__ = (
     "AConv",
     "ADown",
     "Attention",
+    "ASFF2",
     "BNContrastiveHead",
     "Bottleneck",
     "BottleneckCSP",
@@ -42,6 +43,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "DLU",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -1106,6 +1108,132 @@ class C3k2(C2f):
             else Bottleneck(self.c, self.c, shortcut, g)
             for _ in range(n)
         )
+
+
+class ASFF2(nn.Module):
+    """Two-input adaptive spatial feature fusion with channel-preserving output."""
+
+    def __init__(self, channels: list[int] | tuple[int, int], compress_channels: int = 8):
+        """Initialize ASFF2.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of the two input feature maps.
+            compress_channels (int): Hidden channels used to generate spatial fusion weights.
+        """
+        super().__init__()
+        assert len(channels) == 2, "ASFF2 expects exactly two input feature maps"
+        c1, c2 = channels
+        compress_channels = max(4, min(compress_channels, c1, c2))
+        self.weight_level_0 = Conv(c1, compress_channels, 1, 1)
+        self.weight_level_1 = Conv(c2, compress_channels, 1, 1)
+        self.weight_levels = nn.Conv2d(compress_channels * 2, 2, 1, 1, 0)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two same-resolution feature maps with learned spatial weights."""
+        x0, x1 = x
+        weight_0 = self.weight_level_0(x0)
+        weight_1 = self.weight_level_1(x1)
+        weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
+        return torch.cat((x0 * weights[:, 0:1], x1 * weights[:, 1:2]), 1)
+
+
+class DLU(nn.Module):
+    """Dynamic Lightweight Upsampling inspired by Lighten CARAFE."""
+
+    def __init__(
+        self,
+        channels: int,
+        scale_factor: int = 2,
+        up_kernel: int = 5,
+        encoder_kernel: int = 3,
+        encoder_dilation: int = 1,
+        compressed_channels: int = 64,
+    ):
+        """Initialize a pure PyTorch DLU upsampling module.
+
+        Args:
+            channels (int): Input and output feature channels.
+            scale_factor (int): Upsampling ratio.
+            up_kernel (int): Reassembly kernel size.
+            encoder_kernel (int): Kernel size for kernel-space and offset generation.
+            encoder_dilation (int): Dilation used by the generators.
+            compressed_channels (int): Hidden channels after channel compression.
+        """
+        super().__init__()
+        assert scale_factor >= 1, "scale_factor must be >= 1"
+        assert up_kernel % 2 == 1 and up_kernel >= 1, "up_kernel must be a positive odd integer"
+        compressed_channels = min(compressed_channels, channels)
+        padding = (encoder_kernel - 1) * encoder_dilation // 2
+        self.channels = channels
+        self.scale_factor = scale_factor
+        self.up_kernel = up_kernel
+        self.channel_compressor = nn.Conv2d(channels, compressed_channels, 1)
+        self.kernel_space_generator = nn.Conv2d(
+            compressed_channels,
+            up_kernel * up_kernel,
+            encoder_kernel,
+            padding=padding,
+            dilation=encoder_dilation,
+        )
+        self.conv_offset = nn.Conv2d(
+            compressed_channels,
+            2 * scale_factor * scale_factor,
+            encoder_kernel,
+            padding=padding,
+            dilation=encoder_dilation,
+        )
+        self.init_weights()
+
+    def init_weights(self):
+        """Initialize DLU generators."""
+        nn.init.xavier_uniform_(self.channel_compressor.weight)
+        nn.init.zeros_(self.channel_compressor.bias)
+        nn.init.normal_(self.kernel_space_generator.weight, std=0.001)
+        nn.init.zeros_(self.kernel_space_generator.bias)
+        nn.init.zeros_(self.conv_offset.weight)
+        nn.init.zeros_(self.conv_offset.bias)
+
+    def kernel_space_normalizer(self, mask: torch.Tensor) -> torch.Tensor:
+        """Normalize the source kernel space over the reassembly-kernel dimension."""
+        b, c, h, w = mask.shape
+        mask = mask.view(b, 1, c, h, w)
+        mask = F.softmax(mask, dim=2)
+        return mask.view(b, c, h, w).contiguous()
+
+    def kernel_space_expander(self, offset: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Expand low-resolution kernels to high-resolution kernels with learned guidance offsets."""
+        b, _, h, w = offset.shape
+        s = self.scale_factor
+        offset = F.pixel_shuffle(offset, s).permute(0, 2, 3, 1)
+        h_up, w_up = h * s, w * s
+        dtype, device = offset.dtype, offset.device
+        y = torch.repeat_interleave(torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype), s)
+        x = torch.repeat_interleave(torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype), s)
+        grid_y = y.view(h_up, 1).expand(h_up, w_up)
+        grid_x = x.view(1, w_up).expand(h_up, w_up)
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
+        norm_x = 2.0 / max(w - 1, 1)
+        norm_y = 2.0 / max(h - 1, 1)
+        offset = torch.stack((offset[..., 0] * norm_x, offset[..., 1] * norm_y), dim=-1)
+        return F.grid_sample(mask, grid + offset, mode="bilinear", padding_mode="border", align_corners=True)
+
+    def feature_reassemble(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Reassemble features using high-resolution dynamic kernels."""
+        b, c, h, w = x.shape
+        k, s = self.up_kernel, self.scale_factor
+        patches = F.unfold(x, kernel_size=k, padding=k // 2).view(b, c, k * k, h, w)
+        patches = patches.repeat_interleave(s, dim=3).repeat_interleave(s, dim=4)
+        mask = mask.view(b, 1, k * k, h * s, w * s)
+        return (patches * mask).sum(dim=2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample features with dynamic lightweight content-aware reassembly."""
+        compressed_x = self.channel_compressor(x)
+        offset = self.conv_offset(compressed_x)
+        mask = self.kernel_space_generator(compressed_x)
+        mask = self.kernel_space_normalizer(mask)
+        mask = self.kernel_space_expander(offset, mask)
+        return self.feature_reassemble(x, mask)
 
 
 class EMA(nn.Module):
