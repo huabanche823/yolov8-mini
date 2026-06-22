@@ -45,6 +45,7 @@ __all__ = (
     "ContrastiveHead",
     "CoordAtt",
     "DLU",
+    "GAM",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -1222,6 +1223,50 @@ class CoordAtt(nn.Module):
         a_h = self.conv_h(x_h).sigmoid()
         a_w = self.conv_w(x_w).sigmoid()
         return identity * a_h * a_w
+
+
+class GAM(nn.Module):
+    """Global Attention Mechanism for channel-spatial feature recalibration.
+
+    This module follows the common GAM design used by GSO-YOLO's GOM:
+    channel attention is computed without global pooling, then spatial
+    attention is applied with convolutional feature fusion.
+    """
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 4):
+        """Initialize GAM.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+            reduction (int): Channel reduction ratio used in both attention branches.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        hidden = max(c2 // reduction, 1)
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c2, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, c2, bias=False),
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(c2, hidden, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c2, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel attention followed by spatial attention."""
+        x = self.proj(x)
+        b, c, h, w = x.shape
+        channel_att = self.channel_attention(x.permute(0, 2, 3, 1).reshape(b, h * w, c))
+        channel_att = channel_att.reshape(b, h, w, c).permute(0, 3, 1, 2).sigmoid()
+        x = x * channel_att
+        spatial_att = self.spatial_attention(x).sigmoid()
+        return x * spatial_att
 
 
 class DLU(nn.Module):
