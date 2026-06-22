@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
+from .conv import CBAM, Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -56,6 +56,7 @@ __all__ = (
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
+    "ResCBAM",
     "ResNetLayer",
     "SCDown",
     "SEAM",
@@ -1267,6 +1268,35 @@ class GAM(nn.Module):
         x = x * channel_att
         spatial_att = self.spatial_attention(x).sigmoid()
         return x * spatial_att
+
+
+class ResCBAM(nn.Module):
+    """Residual CBAM block for conservative feature recalibration.
+
+    The residual path preserves weak target features while CBAM refines channel
+    and spatial responses, making it safer than plain attention-only gating.
+    """
+
+    def __init__(self, c1: int, c2: int | None = None, kernel_size: int = 7, shortcut: bool = True):
+        """Initialize ResCBAM.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+            kernel_size (int): Spatial attention kernel size, either 3 or 7.
+            shortcut (bool): Whether to add the residual connection.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.cbam = CBAM(c2, kernel_size)
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply residual CBAM attention."""
+        x = self.proj(x)
+        y = self.cbam(x)
+        return x + y if self.add else y
 
 
 class DLU(nn.Module):
