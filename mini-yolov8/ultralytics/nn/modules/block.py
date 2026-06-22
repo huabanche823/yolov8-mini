@@ -39,6 +39,7 @@ __all__ = (
     "C3Ghost",
     "C3k2",
     "C3k2_EMA",
+    "C3k2_RFAConv",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -53,6 +54,7 @@ __all__ = (
     "LSKBlock",
     "MFAM",
     "Proto",
+    "RFAConv",
     "RepC3",
     "RepNCSPELAN4",
     "RepVGGDW",
@@ -487,6 +489,73 @@ class Bottleneck(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RFAConv(nn.Module):
+    """Receptive-field attention convolution.
+
+    RFAConv assigns adaptive weights to each position inside a convolutional
+    receptive field, strengthening local structure modeling for elongated and
+    weak-texture targets.
+    """
+
+    def __init__(self, c1: int, c2: int, kernel_size: int = 3, stride: int = 1):
+        """Initialize RFAConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            kernel_size (int): Receptive field size.
+            stride (int): Stride used when sampling the original feature map.
+        """
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.get_weight = nn.Sequential(
+            nn.AvgPool2d(kernel_size=kernel_size, padding=kernel_size // 2, stride=stride),
+            nn.Conv2d(c1, c1 * kernel_size**2, 1, groups=c1, bias=False),
+        )
+        self.generate_feature = nn.Sequential(
+            nn.Conv2d(
+                c1,
+                c1 * kernel_size**2,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                stride=stride,
+                groups=c1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(c1 * kernel_size**2),
+            nn.SiLU(inplace=True),
+        )
+        self.conv = Conv(c1, c2, kernel_size, kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply receptive-field attention convolution."""
+        b, c, _, _ = x.shape
+        k = self.kernel_size
+        weight = self.get_weight(x)
+        _, _, h, w = weight.shape
+        weight = weight.view(b, c, k * k, h, w).softmax(dim=2)
+        feature = self.generate_feature(x).view(b, c, k * k, h, w)
+        feature = feature * weight
+        feature = feature.view(b, c, k, k, h, w).permute(0, 1, 4, 2, 5, 3).reshape(b, c, h * k, w * k)
+        return self.conv(feature)
+
+
+class Bottleneck_RFAConv(nn.Module):
+    """Bottleneck that replaces the second 3x3 convolution with RFAConv."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_RFAConv."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = RFAConv(c_, c2, 3, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RFAConv bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
@@ -1115,6 +1184,30 @@ class C3k2(C2f):
         )
 
 
+class C3k2_RFAConv(C3k2):
+    """C3k2 variant using RFAConv bottlenecks for stronger local receptive-field modeling."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_RFAConv with the same arguments as C3k2."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_RFAConv(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_RFAConv(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
 class SEAM(nn.Module):
     """Separated and Enhancement Attention Module for feature recalibration."""
 
@@ -1583,6 +1676,16 @@ class C3k(C3):
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+
+class C3k_RFAConv(C3):
+    """C3k block using RFAConv bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize C3k_RFAConv."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_RFAConv(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
 
 class RepVGGDW(torch.nn.Module):
