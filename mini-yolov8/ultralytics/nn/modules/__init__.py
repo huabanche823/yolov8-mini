@@ -54,6 +54,7 @@ from .block import (
     HGBlock,
     HGStem,
     ImagePoolingAttn,
+    LSKBlock,
     MFAM,
     MaxSigmoidAttnBlock,
     Proto,
@@ -62,6 +63,7 @@ from .block import (
     RepVGGDW,
     ResNetLayer,
     SCDown,
+    SEAM,
     TorchVision,
 )
 from .conv import (
@@ -170,6 +172,7 @@ __all__ = (
     "LRPCHead",
     "LayerNorm2d",
     "LightConv",
+    "LSKBlock",
     "MFAM",
     "MLPBlock",
     "MSDeformAttn",
@@ -184,6 +187,7 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "SEAM",
     "Segment",
     "Segment26",
     "SemanticSegment",

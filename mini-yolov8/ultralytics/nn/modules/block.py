@@ -48,6 +48,7 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "LSKBlock",
     "MFAM",
     "Proto",
     "RepC3",
@@ -55,6 +56,7 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "SEAM",
     "TorchVision",
 )
 
@@ -1110,6 +1112,49 @@ class C3k2(C2f):
         )
 
 
+class SEAM(nn.Module):
+    """Separated and Enhancement Attention Module for feature recalibration."""
+
+    def __init__(self, c1: int, c2: int | None = None, depth: int = 1, reduction: int = 16):
+        """Initialize SEAM.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1`` for attention-only use.
+            depth (int): Number of depthwise enhancement blocks.
+            reduction (int): Channel reduction ratio in the attention MLP.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.enhance = nn.Sequential(
+            *(
+                nn.Sequential(
+                    nn.Conv2d(c2, c2, 3, 1, 1, groups=c2, bias=False),
+                    nn.BatchNorm2d(c2),
+                    nn.GELU(),
+                )
+                for _ in range(max(depth, 1))
+            )
+        )
+        hidden = max(c2 // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(c2, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, c2, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply depthwise feature enhancement followed by channel attention."""
+        x = self.proj(x)
+        y = self.enhance(x)
+        b, c, _, _ = y.shape
+        y = self.fc(self.pool(y).view(b, c)).view(b, c, 1, 1)
+        return x * y
+
+
 class ASFF2(nn.Module):
     """Two-input adaptive spatial feature fusion with channel-preserving output."""
 
@@ -1354,6 +1399,52 @@ class MFAM(nn.Module):
         y = list(self.cv1(x).chunk(2, 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class LSKBlock(nn.Module):
+    """Large selective-kernel spatial attention block for degraded-scene detection features.
+
+    The design follows the large selective kernel idea from LSKNet: combine a local
+    depthwise branch and a larger dilated depthwise branch, then learn spatially
+    varying selection weights. It is inserted as a lightweight residual feature
+    recalibration block before detection heads.
+    """
+
+    def __init__(self, c1: int, c2: int | None = None, k1: int = 5, k2: int = 7, dilation: int = 3):
+        """Initialize LSKBlock.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1`` for attention-only use.
+            k1 (int): Local depthwise kernel size.
+            k2 (int): Dilated depthwise kernel size.
+            dilation (int): Dilation for the large-kernel branch.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.local = nn.Conv2d(c2, c2, k1, 1, autopad(k1), groups=c2, bias=False)
+        self.context = nn.Conv2d(c2, c2, k2, 1, autopad(k2, d=dilation), dilation=dilation, groups=c2, bias=False)
+        self.reduce_local = nn.Conv2d(c2, c2 // 2, 1, bias=False)
+        self.reduce_context = nn.Conv2d(c2, c2 // 2, 1, bias=False)
+        self.spatial_select = nn.Conv2d(2, 2, 7, 1, 3, bias=True)
+        self.expand = nn.Conv2d(c2 // 2, c2, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply large selective-kernel feature recalibration."""
+        x = self.proj(x)
+        local = self.reduce_local(self.local(x))
+        context = self.reduce_context(self.context(self.local(x)))
+        pooled = torch.cat(
+            (torch.mean(torch.cat((local, context), 1), dim=1, keepdim=True),
+             torch.max(torch.cat((local, context), 1), dim=1, keepdim=True)[0]),
+            dim=1,
+        )
+        weights = torch.sigmoid(self.spatial_select(pooled))
+        y = local * weights[:, 0:1] + context * weights[:, 1:2]
+        return x + self.act(self.bn(self.expand(y)))
 
 
 class C3k(C3):
