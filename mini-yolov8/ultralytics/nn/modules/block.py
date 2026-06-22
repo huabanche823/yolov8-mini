@@ -43,6 +43,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "CoordAtt",
     "DLU",
     "GhostBottleneck",
     "HGBlock",
@@ -1180,6 +1181,47 @@ class ASFF2(nn.Module):
         weight_1 = self.weight_level_1(x1)
         weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
         return torch.cat((x0 * weights[:, 0:1], x1 * weights[:, 1:2]), 1)
+
+
+class CoordAtt(nn.Module):
+    """Coordinate Attention for direction-aware feature recalibration.
+
+    CoordAtt encodes long-range dependencies along height and width separately,
+    which is useful for elongated targets such as reinforcement bars and timber.
+    """
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 32):
+        """Initialize CoordAtt.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1`` for attention-only use.
+            reduction (int): Channel reduction ratio used by the shared transform.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        mip = max(8, c2 // reduction)
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.conv1 = nn.Conv2d(c2, mip, 1, 1, 0, bias=False)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish(inplace=True)
+        self.conv_h = nn.Conv2d(mip, c2, 1, 1, 0, bias=False)
+        self.conv_w = nn.Conv2d(mip, c2, 1, 1, 0, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply coordinate attention."""
+        x = self.proj(x)
+        identity = x
+        _, _, h, w = x.size()
+        x_h = x.mean(dim=3, keepdim=True)
+        x_w = x.mean(dim=2, keepdim=True).permute(0, 1, 3, 2)
+        y = torch.cat((x_h, x_w), dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+        return identity * a_h * a_w
 
 
 class DLU(nn.Module):
