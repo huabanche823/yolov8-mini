@@ -37,6 +37,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_DSConv,
     C3k2_EMA,
     C3k2_RFAConv,
     C3x,
@@ -1701,6 +1702,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_DSConv,
             C3k2_EMA,
             C3k2_RFAConv,
             RepNCSPELAN4,
@@ -1735,6 +1737,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_DSConv,
             C3k2_EMA,
             C3k2_RFAConv,
             C2fAttn,
@@ -1775,7 +1778,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_EMA, C3k2_RFAConv}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_DSConv, C3k2_EMA, C3k2_RFAConv}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True

@@ -38,6 +38,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_DSConv",
     "C3k2_EMA",
     "C3k2_RFAConv",
     "C3x",
@@ -46,6 +47,7 @@ __all__ = (
     "ContrastiveHead",
     "CoordAtt",
     "DLU",
+    "DSConv",
     "GAM",
     "GhostBottleneck",
     "HGBlock",
@@ -543,6 +545,83 @@ class RFAConv(nn.Module):
         return self.conv(feature)
 
 
+class DSConv(nn.Module):
+    """Dynamic snake convolution for local elongated-structure modeling.
+
+    This implementation samples horizontal and vertical snake-like receptive
+    fields with dynamic offsets, then fuses them with a standard 3x3 branch.
+    It keeps the feature map size unchanged for use inside YOLO bottlenecks.
+    """
+
+    def __init__(self, c1: int, c2: int, kernel_size: int = 3, extend_scope: float = 1.0):
+        """Initialize DSConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            kernel_size (int): Number of sampling points along each snake axis.
+            extend_scope (float): Offset range multiplier.
+        """
+        super().__init__()
+        assert kernel_size % 2 == 1, "DSConv kernel_size must be odd"
+        self.kernel_size = kernel_size
+        self.extend_scope = extend_scope
+        self.offset = nn.Sequential(
+            nn.Conv2d(c1, 2 * kernel_size, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(2 * kernel_size),
+            nn.Tanh(),
+        )
+        self.conv = Conv(c1, c2, 3, 1)
+        self.conv_h = Conv(c1 * kernel_size, c2, 1, 1)
+        self.conv_v = Conv(c1 * kernel_size, c2, 1, 1)
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def _snake_offset(self, offset: torch.Tensor) -> torch.Tensor:
+        """Accumulate offsets from the center point to preserve snake continuity."""
+        center = self.kernel_size // 2
+        left = torch.flip(torch.cumsum(torch.flip(offset[:, :center], dims=[1]), dim=1), dims=[1])
+        middle = torch.zeros_like(offset[:, center : center + 1])
+        right = torch.cumsum(offset[:, center + 1 :], dim=1)
+        snake = torch.cat((left, middle, right), dim=1)
+        return snake * self.extend_scope
+
+    @staticmethod
+    def _normalize_grid(x: torch.Tensor, y: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """Convert absolute coordinates to the normalized grid_sample range."""
+        x = 2.0 * x / (w - 1) - 1.0 if w > 1 else torch.zeros_like(x)
+        y = 2.0 * y / (h - 1) - 1.0 if h > 1 else torch.zeros_like(y)
+        return torch.stack((x, y), dim=-1)
+
+    def _sample_axis(self, x: torch.Tensor, snake_offset: torch.Tensor, axis: str) -> torch.Tensor:
+        """Sample a horizontal or vertical snake receptive field."""
+        _, _, h, w = x.shape
+        device, dtype = x.device, x.dtype
+        y_base, x_base = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype),
+            torch.arange(w, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        center = self.kernel_size // 2
+        features = []
+        for i in range(self.kernel_size):
+            delta = i - center
+            x_ref = x_base.unsqueeze(0).expand_as(snake_offset[:, i])
+            y_ref = y_base.unsqueeze(0).expand_as(snake_offset[:, i])
+            if axis == "h":
+                grid = self._normalize_grid(x_ref + delta, y_ref + snake_offset[:, i], h, w)
+            else:
+                grid = self._normalize_grid(x_ref + snake_offset[:, i], y_ref + delta, h, w)
+            features.append(F.grid_sample(x, grid, mode="bilinear", padding_mode="border", align_corners=True))
+        return torch.cat(features, dim=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply dynamic snake convolution."""
+        offset_h, offset_v = self.offset(x).chunk(2, dim=1)
+        h_feat = self.conv_h(self._sample_axis(x, self._snake_offset(offset_h), "h"))
+        v_feat = self.conv_v(self._sample_axis(x, self._snake_offset(offset_v), "v"))
+        return self.fuse(self.conv(x) + h_feat + v_feat)
+
+
 class Bottleneck_RFAConv(nn.Module):
     """Bottleneck that replaces the second 3x3 convolution with RFAConv."""
 
@@ -556,6 +635,22 @@ class Bottleneck_RFAConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RFAConv bottleneck with optional shortcut connection."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class Bottleneck_DSConv(nn.Module):
+    """Bottleneck that replaces the second 3x3 convolution with DSConv."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_DSConv."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = DSConv(c_, c2, 3, 1.0)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DSConv bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
@@ -1184,6 +1279,30 @@ class C3k2(C2f):
         )
 
 
+class C3k2_DSConv(C3k2):
+    """C3k2 variant using DSConv bottlenecks for elongated-structure modeling."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_DSConv with the same arguments as C3k2."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_DSConv(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_DSConv(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
 class C3k2_RFAConv(C3k2):
     """C3k2 variant using RFAConv bottlenecks for stronger local receptive-field modeling."""
 
@@ -1676,6 +1795,16 @@ class C3k(C3):
         c_ = int(c2 * e)  # hidden channels
         # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+
+
+class C3k_DSConv(C3):
+    """C3k block using DSConv bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize C3k_DSConv."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_DSConv(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
 
 class C3k_RFAConv(C3):
