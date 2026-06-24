@@ -28,6 +28,7 @@ from ultralytics.nn.modules import (
     A2C2f,
     AConv,
     ADown,
+    AFPNFuse2,
     ASFF2,
     Bottleneck,
     BottleneckCSP,
@@ -1797,6 +1798,11 @@ def parse_model(d, ch, verbose=True):
             c1 = [ch[x] for x in f]
             args = [c1, *args]
             c2 = sum(c1)
+        elif m is AFPNFuse2:
+            c1 = [ch[x] for x in f]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

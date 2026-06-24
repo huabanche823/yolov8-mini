@@ -27,6 +27,7 @@ __all__ = (
     "SPPF",
     "AConv",
     "ADown",
+    "AFPNFuse2",
     "Attention",
     "ASFF2",
     "BNContrastiveHead",
@@ -1395,6 +1396,43 @@ class ASFF2(nn.Module):
         weight_1 = self.weight_level_1(x1)
         weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
         return torch.cat((x0 * weights[:, 0:1], x1 * weights[:, 1:2]), 1)
+
+
+class AFPNFuse2(nn.Module):
+    """Two-input adaptive fusion block for an AFPN-lite neck.
+
+    The block aligns two same-resolution feature maps to the same channel count,
+    predicts spatially adaptive branch weights, and outputs a weighted sum. It is
+    intentionally lightweight so the backbone and detection head can stay
+    unchanged during neck-only ablation experiments.
+    """
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, compress_channels: int = 8):
+        """Initialize AFPNFuse2.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of the two input feature maps.
+            c2 (int): Output channel count after alignment and fusion.
+            compress_channels (int): Hidden channels used to predict spatial fusion weights.
+        """
+        super().__init__()
+        assert len(channels) == 2, "AFPNFuse2 expects exactly two input feature maps"
+        c1, c1_b = channels
+        compress_channels = max(4, min(compress_channels, c2))
+        self.align0 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.align1 = Conv(c1_b, c2, 1, 1) if c1_b != c2 else nn.Identity()
+        self.weight0 = Conv(c2, compress_channels, 1, 1)
+        self.weight1 = Conv(c2, compress_channels, 1, 1)
+        self.weight_levels = nn.Conv2d(compress_channels * 2, 2, 1, 1, 0)
+        self.refine = Conv(c2, c2, 3, 1)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two same-resolution feature maps with learned spatial weights."""
+        x0, x1 = self.align0(x[0]), self.align1(x[1])
+        weight_0 = self.weight0(x0)
+        weight_1 = self.weight1(x1)
+        weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
+        return self.refine(x0 * weights[:, 0:1] + x1 * weights[:, 1:2])
 
 
 class CoordAtt(nn.Module):
