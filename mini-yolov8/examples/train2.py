@@ -86,5 +86,26 @@ YOLOv11_dsconv_lsk summary (fused): 158 layers, 2,757,589 parameters, 0 gradient
                 timber        192        430      0.744      0.833      0.843      0.594
 Speed: 2.2ms preprocess, 1.6ms inference, 0.0ms loss, 2.6ms postprocess per image
 
+YOLOv11_dsconv_rescbam_p5 summary (fused): 149 layers, 2,680,681 parameters, 0 gradients, 6.5 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100% ━━━━━━━━━━━━ 6/6 1.7it/s 3.6s
+                   all        355       1894      0.893       0.83      0.893      0.633
+                 Brick        219        399      0.946      0.871      0.937      0.679
+              Concrete        217        522      0.977      0.893      0.971      0.739
+        Plastic Bottle        129        231      0.772      0.818       0.84      0.557
+         Reinforcement        174        312      0.888      0.714      0.815      0.531
+                timber        192        430      0.882      0.854      0.904      0.657
+Speed: 2.3ms preprocess, 1.4ms inference, 0.0ms loss, 2.1ms postprocess per image
+
+YOLOv11 summary (fused): 101 layers, 2,583,127 parameters, 0 gradients, 6.3 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100% ━━━━━━━━━━━━ 6/6 1.6s/it 9.8s
+                   all        355       1894      0.928      0.844      0.912       0.65
+                 Brick        219        399      0.965      0.885      0.937       0.69
+              Concrete        217        522      0.977      0.908      0.966      0.748
+        Plastic Bottle        129        231      0.911      0.842      0.904      0.586
+         Reinforcement        174        312      0.909      0.704      0.833      0.555
+                timber        192        430      0.879      0.882      0.917      0.673
+Speed: 3.0ms preprocess, 2.0ms inference, 0.0ms loss, 5.1ms postprocess per image
+Results saved to /root/yolov8-mini/mini-yolov8/runs/WasteSortingv3_yolov11_challenge
+
 
 """
