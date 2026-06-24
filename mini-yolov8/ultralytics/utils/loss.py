@@ -19,6 +19,39 @@ from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
 
+USE_WIOU = False
+
+
+def bbox_wiou_loss(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-7) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Wise-IoU v1 loss for xyxy boxes.
+
+    WIoU v1 weights the plain IoU loss with a distance attention term, encouraging
+    stable localization without changing assignment or evaluation IoU behavior.
+    """
+    b1_x1, b1_y1, b1_x2, b1_y2 = box1.float().chunk(4, -1)
+    b2_x1, b2_y1, b2_x2, b2_y2 = box2.float().chunk(4, -1)
+
+    w1, h1 = (b1_x2 - b1_x1).clamp(min=eps), (b1_y2 - b1_y1).clamp(min=eps)
+    w2, h2 = (b2_x2 - b2_x1).clamp(min=eps), (b2_y2 - b2_y1).clamp(min=eps)
+
+    inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp(min=0) * (
+        b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
+    ).clamp(min=0)
+    union = w1 * h1 + w2 * h2 - inter + eps
+    iou = inter / union
+
+    b1_cx, b1_cy = (b1_x1 + b1_x2) * 0.5, (b1_y1 + b1_y2) * 0.5
+    b2_cx, b2_cy = (b2_x1 + b2_x2) * 0.5, (b2_y1 + b2_y2) * 0.5
+    center_dist = (b1_cx - b2_cx).pow(2) + (b1_cy - b2_cy).pow(2)
+
+    cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)
+    ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)
+    enclosing_diag = (cw.pow(2) + ch.pow(2) + eps).detach()
+    distance_attention = torch.exp((center_dist / enclosing_diag).clamp(max=10.0))
+
+    return distance_attention * (1.0 - iou), iou
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -129,8 +162,12 @@ class BboxLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute IoU and DFL losses for bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        if USE_WIOU:
+            wiou_loss, iou = bbox_wiou_loss(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+            loss_iou = (wiou_loss * weight).sum() / target_scores_sum
+        else:
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
