@@ -65,6 +65,8 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "SEAM",
+    "SNIFuse2",
+    "FreqFusionLite",
     "TorchVision",
 )
 
@@ -1433,6 +1435,114 @@ class AFPNFuse2(nn.Module):
         weight_1 = self.weight1(x1)
         weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
         return self.refine(x0 * weights[:, 0:1] + x1 * weights[:, 1:2])
+
+
+class SNIFuse2(nn.Module):
+    """Soft nearest-neighbor interpolation fusion for a lightweight SNI neck.
+
+    The first input is resized to the second input's spatial size using a
+    learnable blend of nearest-neighbor and smoothed interpolation, then both
+    branches are adaptively fused. This keeps the module lightweight while
+    reducing hard upsampling artifacts at feature pyramid fusion points.
+    """
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, compress_channels: int = 8):
+        """Initialize SNIFuse2.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of the two input feature maps.
+            c2 (int): Output channel count after alignment and fusion.
+            compress_channels (int): Hidden channels used to predict spatial fusion weights.
+        """
+        super().__init__()
+        assert len(channels) == 2, "SNIFuse2 expects exactly two input feature maps"
+        c1, c1_b = channels
+        compress_channels = max(4, min(compress_channels, c2))
+        self.align0 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.align1 = Conv(c1_b, c2, 1, 1) if c1_b != c2 else nn.Identity()
+        self.sni_alpha = nn.Parameter(torch.tensor(0.5))
+        self.weight0 = Conv(c2, compress_channels, 1, 1)
+        self.weight1 = Conv(c2, compress_channels, 1, 1)
+        self.weight_levels = nn.Conv2d(compress_channels * 2, 2, 1, 1, 0)
+        self.refine = Conv(c2, c2, 3, 1)
+
+    def _sni_resize(self, x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Resize with a learnable blend of nearest and smoothed interpolation."""
+        if x.shape[-2:] == size:
+            return x
+        nearest = F.interpolate(x, size=size, mode="nearest")
+        smooth = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        smooth = F.interpolate(smooth, size=size, mode="bilinear", align_corners=False)
+        alpha = self.sni_alpha.sigmoid()
+        return alpha * nearest + (1.0 - alpha) * smooth
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two adjacent-scale feature maps with soft interpolation alignment."""
+        x0, x1 = x
+        x0 = self._sni_resize(x0, x1.shape[-2:])
+        x0, x1 = self.align0(x0), self.align1(x1)
+        weight_0 = self.weight0(x0)
+        weight_1 = self.weight1(x1)
+        weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
+        return self.refine(x0 * weights[:, 0:1] + x1 * weights[:, 1:2])
+
+
+class FreqFusionLite(nn.Module):
+    """Lightweight frequency-aware two-input fusion for YOLO necks.
+
+    The block aligns two adjacent-scale features, separates each into low- and
+    high-frequency components via average pooling, then fuses semantic low
+    frequency and boundary high frequency components with learned weights.
+    """
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, compress_channels: int = 8):
+        """Initialize FreqFusionLite.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of the two input feature maps.
+            c2 (int): Output channel count after alignment and fusion.
+            compress_channels (int): Hidden channels used to predict frequency fusion weights.
+        """
+        super().__init__()
+        assert len(channels) == 2, "FreqFusionLite expects exactly two input feature maps"
+        c1, c1_b = channels
+        compress_channels = max(4, min(compress_channels, c2))
+        self.align0 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.align1 = Conv(c1_b, c2, 1, 1) if c1_b != c2 else nn.Identity()
+        self.low0 = Conv(c2, compress_channels, 1, 1)
+        self.low1 = Conv(c2, compress_channels, 1, 1)
+        self.high0 = Conv(c2, compress_channels, 1, 1)
+        self.high1 = Conv(c2, compress_channels, 1, 1)
+        self.low_weights = nn.Conv2d(compress_channels * 2, 2, 1, 1, 0)
+        self.high_weights = nn.Conv2d(compress_channels * 2, 2, 1, 1, 0)
+        self.high_scale = nn.Parameter(torch.tensor(0.5))
+        self.refine = Conv(c2, c2, 3, 1)
+
+    @staticmethod
+    def _resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Resize feature map to target size when adjacent scales differ."""
+        return x if x.shape[-2:] == size else F.interpolate(x, size=size, mode="nearest")
+
+    @staticmethod
+    def _split_frequency(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split feature into low-frequency context and high-frequency detail."""
+        low = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        high = x - low
+        return low, high
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two adjacent-scale features with low/high-frequency weighting."""
+        x0, x1 = x
+        x0 = self._resize(x0, x1.shape[-2:])
+        x0, x1 = self.align0(x0), self.align1(x1)
+        low0, high0 = self._split_frequency(x0)
+        low1, high1 = self._split_frequency(x1)
+
+        low_weights = torch.softmax(self.low_weights(torch.cat((self.low0(low0), self.low1(low1)), 1)), dim=1)
+        high_weights = torch.softmax(self.high_weights(torch.cat((self.high0(high0), self.high1(high1)), 1)), dim=1)
+        low = low0 * low_weights[:, 0:1] + low1 * low_weights[:, 1:2]
+        high = high0 * high_weights[:, 0:1] + high1 * high_weights[:, 1:2]
+        return self.refine(low + self.high_scale.sigmoid() * high)
 
 
 class CoordAtt(nn.Module):

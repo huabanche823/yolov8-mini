@@ -55,6 +55,7 @@ from .block import (
     CoordAtt,
     DLU,
     DSConv,
+    FreqFusionLite,
     GAM,
     GhostBottleneck,
     HGBlock,
@@ -72,6 +73,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     SEAM,
+    SNIFuse2,
     TorchVision,
 )
 from .conv import (
@@ -167,6 +169,7 @@ __all__ = (
     "CoordAtt",
     "DLU",
     "DSConv",
+    "FreqFusionLite",
     "GAM",
     "Conv",
     "Conv2",
@@ -204,6 +207,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "SEAM",
+    "SNIFuse2",
     "Segment",
     "Segment26",
     "SemanticSegment",

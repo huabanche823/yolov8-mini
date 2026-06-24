@@ -54,6 +54,7 @@ from ultralytics.nn.modules import (
     DLU,
     DWConv,
     DWConvTranspose2d,
+    FreqFusionLite,
     Focus,
     GAM,
     GhostBottleneck,
@@ -76,6 +77,7 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     SEAM,
+    SNIFuse2,
     Segment,
     Segment26,
     SemanticSegment,
@@ -1799,6 +1801,11 @@ def parse_model(d, ch, verbose=True):
             args = [c1, *args]
             c2 = sum(c1)
         elif m is AFPNFuse2:
+            c1 = [ch[x] for x in f]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
+        elif m in frozenset({SNIFuse2, FreqFusionLite}):
             c1 = [ch[x] for x in f]
             c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
