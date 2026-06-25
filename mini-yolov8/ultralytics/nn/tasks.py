@@ -52,6 +52,7 @@ from ultralytics.nn.modules import (
     CoordAtt,
     Detect,
     DLU,
+    DyHeadLiteDetect,
     DWConv,
     DWConvTranspose2d,
     ESEDetect,
@@ -1826,6 +1827,7 @@ def parse_model(d, ch, verbose=True):
         elif m in frozenset(
             {
                 Detect,
+                DyHeadLiteDetect,
                 ESEDetect,
                 WorldDetect,
                 YOLOEDetect,
@@ -1844,6 +1846,7 @@ def parse_model(d, ch, verbose=True):
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {
                 Detect,
+                DyHeadLiteDetect,
                 ESEDetect,
                 YOLOEDetect,
                 Segment,

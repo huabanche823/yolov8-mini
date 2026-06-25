@@ -24,6 +24,7 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "DyHeadLiteDetect",
     "ESEDetect",
     "Pose",
     "RTDETRDecoder",
@@ -307,6 +308,63 @@ class ESEDetect(Detect):
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class DyHeadLiteBlock(nn.Module):
+    """Lightweight Dynamic Head block with scale, spatial, and channel-task attention."""
+
+    def __init__(self, channels: int, nl: int):
+        """Initialize a lite DyHead block for same-channel multi-scale features."""
+        super().__init__()
+        self.nl = nl
+        self.scale_weights = nn.Parameter(torch.ones(nl, 3))
+        self.spatial_attn = nn.ModuleList(nn.Sequential(nn.Conv2d(2, 1, 7, padding=3, bias=False), nn.Sigmoid()) for _ in range(nl))
+        self.task_attn = nn.ModuleList(
+            nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(channels, channels, 1), nn.Sigmoid()) for _ in range(nl)
+        )
+        self.out = nn.ModuleList(Conv(channels, channels, 3) for _ in range(nl))
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Fuse adjacent pyramid levels and recalibrate each feature map."""
+        out = []
+        for i in range(self.nl):
+            refs, weight_ids = [], []
+            if i > 0:
+                refs.append(F.interpolate(x[i - 1], size=x[i].shape[2:], mode="nearest"))
+                weight_ids.append(0)
+            refs.append(x[i])
+            weight_ids.append(1)
+            if i < self.nl - 1:
+                refs.append(F.interpolate(x[i + 1], size=x[i].shape[2:], mode="nearest"))
+                weight_ids.append(2)
+
+            weights = self.scale_weights[i, weight_ids].softmax(0)
+            y = sum(w * feat for w, feat in zip(weights, refs))
+            spatial = self.spatial_attn[i](torch.cat((y.mean(1, keepdim=True), y.amax(1, keepdim=True)), 1))
+            y = y * spatial
+            y = y * self.task_attn[i](y)
+            out.append(self.out[i](y) + x[i])
+        return out
+
+
+class DyHeadLiteDetect(Detect):
+    """YOLO Detect head with a lightweight Dynamic Head feature adapter before prediction."""
+
+    def __init__(self, nc: int = 80, dy_blocks: int = 1, hidden: int = 0, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize DyHead-lite Detect with optional block count and hidden channel size."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = int(hidden) if hidden else max(16, min(ch))
+        self.dy_lateral = nn.ModuleList(Conv(c, hidden, 1) if c != hidden else nn.Identity() for c in ch)
+        self.dy_blocks = nn.ModuleList(DyHeadLiteBlock(hidden, self.nl) for _ in range(int(dy_blocks)))
+        self.dy_restore = nn.ModuleList(Conv(hidden, c, 1) if c != hidden else nn.Identity() for c in ch)
+
+    def forward(self, x: list[torch.Tensor]):
+        """Apply DyHead-lite feature adaptation, then run the standard YOLO detection head."""
+        y = [self.dy_lateral[i](x[i]) for i in range(self.nl)]
+        for block in self.dy_blocks:
+            y = block(y)
+        y = [self.dy_restore[i](y[i]) for i in range(self.nl)]
+        return super().forward(y)
 
 
 class Segment(Detect):
