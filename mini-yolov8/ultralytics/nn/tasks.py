@@ -25,6 +25,7 @@ from ultralytics.nn.modules import (
     SPP,
     SPPELAN,
     SPPF,
+    SPDConv,
     A2C2f,
     AConv,
     ADown,
@@ -38,6 +39,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2_DDFM,
     C3k2_DSConv,
     C3k2_EMA,
     C3k2_RFAConv,
@@ -1698,6 +1700,7 @@ def parse_model(d, ch, verbose=True):
             GhostBottleneck,
             SPP,
             SPPF,
+            SPDConv,
             C2fPSA,
             C2PSA,
             DWConv,
@@ -1707,6 +1710,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
             C3k2_RFAConv,
@@ -1742,6 +1746,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
             C3k2_RFAConv,
@@ -1783,7 +1788,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_DSConv, C3k2_EMA, C3k2_RFAConv}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_RFAConv}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True

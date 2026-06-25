@@ -25,6 +25,7 @@ __all__ = (
     "SPP",
     "SPPELAN",
     "SPPF",
+    "SPDConv",
     "AConv",
     "ADown",
     "AFPNFuse2",
@@ -39,6 +40,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2_DDFM",
     "C3k2_DSConv",
     "C3k2_EMA",
     "C3k2_RFAConv",
@@ -47,6 +49,7 @@ __all__ = (
     "CBLinear",
     "ContrastiveHead",
     "CoordAtt",
+    "DDFMLite",
     "DLU",
     "DSConv",
     "GAM",
@@ -625,6 +628,68 @@ class DSConv(nn.Module):
         return self.fuse(self.conv(x) + h_feat + v_feat)
 
 
+class DDFMLite(nn.Module):
+    """Lightweight directional detail feature module for weak edges and thin objects."""
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 4):
+        """Initialize DDFM-lite.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+            reduction (int): Channel reduction ratio for the detail gate.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        hidden = max(c2 // reduction, 8)
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.local = Conv(c2, c2, 3, 1)
+        self.h_detail = nn.Sequential(
+            nn.Conv2d(c2, c2, (1, 3), 1, (0, 1), groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+        )
+        self.v_detail = nn.Sequential(
+            nn.Conv2d(c2, c2, (3, 1), 1, (1, 0), groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+        )
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c2, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c2, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Enhance local features with gated horizontal and vertical detail branches."""
+        y = self.proj(x)
+        local = self.local(y)
+        detail = self.h_detail(local) + self.v_detail(local)
+        return self.fuse(local + detail * self.gate(detail))
+
+
+class SPDConv(nn.Module):
+    """Space-to-depth convolution for detail-preserving stride-2 downsampling."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3):
+        """Initialize SPDConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            k (int): Kernel size after space-to-depth rearrangement.
+        """
+        super().__init__()
+        self.conv = Conv(c1 * 4, c2, k, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Rearrange neighboring pixels into channels, then convolve."""
+        return self.conv(torch.cat((x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]), 1))
+
+
 class Bottleneck_RFAConv(nn.Module):
     """Bottleneck that replaces the second 3x3 convolution with RFAConv."""
 
@@ -654,6 +719,22 @@ class Bottleneck_DSConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DSConv bottleneck with optional shortcut connection."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class Bottleneck_DDFM(nn.Module):
+    """Bottleneck that replaces the second 3x3 convolution with DDFM-lite."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize DDFM-lite bottleneck."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = DDFMLite(c_, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DDFM-lite bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
@@ -1278,6 +1359,30 @@ class C3k2(C2f):
             else C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck(self.c, self.c, shortcut, g)
+            for _ in range(n)
+        )
+
+
+class C3k2_DDFM(C3k2):
+    """C3k2 variant using DDFM-lite bottlenecks for weak-boundary and directional detail modeling."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_DDFM with the same arguments as C3k2."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_DDFM(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_DDFM(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
@@ -1953,6 +2058,16 @@ class C3k_DSConv(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = nn.Sequential(*(Bottleneck_DSConv(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+class C3k_DDFM(C3):
+    """C3k block using DDFM-lite bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize C3k_DDFM."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_DDFM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
 
 class C3k_RFAConv(C3):
