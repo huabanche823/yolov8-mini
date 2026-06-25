@@ -24,6 +24,7 @@ __all__ = (
     "OBB",
     "Classify",
     "Detect",
+    "ESEDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -260,6 +261,52 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class ESEAttn(nn.Module):
+    """Effective squeeze-excitation attention used by the lightweight ESE detection head."""
+
+    def __init__(self, channels: int):
+        """Initialize ESE attention with a single 1x1 gating convolution."""
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(channels, channels, 1)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel reweighting from global context."""
+        return x * self.act(self.conv(self.avg_pool(x)))
+
+
+class ESEDetect(Detect):
+    """YOLO Detect head with PP-YOLOE-style lightweight ESE branch calibration."""
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize ESEDetect by inserting ESE attention before box/class prediction layers."""
+        super().__init__(nc, reg_max, end2end, ch)
+        c2 = max((16, ch[0] // 4, self.reg_max * 4))
+        c3 = max(ch[0], min(self.nc, 100))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), ESEAttn(c2), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = (
+            nn.ModuleList(
+                nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), ESEAttn(c3), nn.Conv2d(c3, self.nc, 1)) for x in ch
+            )
+            if self.legacy
+            else nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    ESEAttn(c3),
+                    nn.Conv2d(c3, self.nc, 1),
+                )
+                for x in ch
+            )
+        )
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
 
 
 class Segment(Detect):
