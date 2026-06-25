@@ -144,6 +144,7 @@ CFG_FLOAT_KEYS = frozenset(
         "cls",
         "cls_pw",
         "dfl",
+        "shape_iou_scale",
         "degrees",
         "shear",
         "time",

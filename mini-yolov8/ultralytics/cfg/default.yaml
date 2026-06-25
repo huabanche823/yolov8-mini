@@ -104,6 +104,8 @@ cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)
 minority_oversample: False # (bool) enable online weighted sampling for minority detection classes
 dfl: 1.5 # (float) distribution focal loss gain
+bbox_loss: ciou # (str) bbox regression loss: ciou, wiou, mpdiou, shape_iou
+shape_iou_scale: 0.0 # (float) Shape-IoU scale factor; only used when bbox_loss=shape_iou
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
