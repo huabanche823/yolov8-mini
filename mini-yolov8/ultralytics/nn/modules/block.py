@@ -43,6 +43,7 @@ __all__ = (
     "C3k2_DDFM",
     "C3k2_DSConv",
     "C3k2_EMA",
+    "C3k2_MSBlock",
     "C3k2_RFAConv",
     "C3x",
     "CBFuse",
@@ -53,12 +54,14 @@ __all__ = (
     "DLU",
     "DSConv",
     "GAM",
+    "GCBlock",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
     "LSKBlock",
     "MFAM",
+    "MSBlock",
     "Proto",
     "RFAConv",
     "RepC3",
@@ -690,6 +693,77 @@ class SPDConv(nn.Module):
         return self.conv(torch.cat((x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]), 1))
 
 
+class MSBlock(nn.Module):
+    """Multi-scale depthwise convolution block inspired by YOLO-MS."""
+
+    def __init__(self, c1: int, c2: int | None = None, kernels: tuple[int, ...] = (3, 5, 7)):
+        """Initialize MSBlock.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+            kernels (tuple[int, ...]): Depthwise kernel sizes for multi-scale branches.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        splits = [c2 // len(kernels) for _ in kernels]
+        splits[-1] += c2 - sum(splits)
+        self.splits = splits
+        self.branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c, c, k, 1, k // 2, groups=c, bias=False),
+                nn.BatchNorm2d(c),
+                nn.SiLU(inplace=True),
+            )
+            for c, k in zip(splits, kernels)
+        )
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract and fuse multi-scale local features."""
+        x = self.proj(x)
+        y = [branch(part) for branch, part in zip(self.branches, torch.split(x, self.splits, dim=1))]
+        return self.fuse(torch.cat(y, dim=1)) + x
+
+
+class GCBlock(nn.Module):
+    """Global context block for lightweight context-guided feature recalibration."""
+
+    def __init__(self, c1: int, c2: int | None = None, ratio: float = 0.25):
+        """Initialize GCBlock.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+            ratio (float): Bottleneck ratio for context transform.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        hidden = max(int(c2 * ratio), 8)
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.conv_mask = nn.Conv2d(c2, 1, 1)
+        self.channel_add = nn.Sequential(
+            nn.Conv2d(c2, hidden, 1, bias=False),
+            nn.LayerNorm([hidden, 1, 1]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c2, 1, bias=False),
+        )
+
+    def spatial_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply attention pooling to obtain global context."""
+        b, c, h, w = x.shape
+        input_x = x.view(b, c, h * w).unsqueeze(1)
+        context_mask = self.conv_mask(x).view(b, 1, h * w)
+        context_mask = torch.softmax(context_mask, dim=2).unsqueeze(-1)
+        return torch.matmul(input_x, context_mask).view(b, c, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Recalibrate features with global context while preserving residual content."""
+        x = self.proj(x)
+        return x + self.channel_add(self.spatial_pool(x))
+
+
 class Bottleneck_RFAConv(nn.Module):
     """Bottleneck that replaces the second 3x3 convolution with RFAConv."""
 
@@ -735,6 +809,22 @@ class Bottleneck_DDFM(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DDFM-lite bottleneck with optional shortcut connection."""
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class Bottleneck_MSBlock(nn.Module):
+    """Bottleneck that replaces the second 3x3 convolution with MSBlock."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize MSBlock bottleneck."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = MSBlock(c_, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply MSBlock bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
@@ -1383,6 +1473,30 @@ class C3k2_DDFM(C3k2):
             C3k_DDFM(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_DDFM(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_MSBlock(C3k2):
+    """C3k2 variant using MSBlock bottlenecks for multi-scale local feature modeling."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_MSBlock with the same arguments as C3k2."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_MSBlock(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_MSBlock(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
@@ -2068,6 +2182,16 @@ class C3k_DDFM(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = nn.Sequential(*(Bottleneck_DDFM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+class C3k_MSBlock(C3):
+    """C3k block using MSBlock bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize C3k_MSBlock."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(Bottleneck_MSBlock(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
 
 class C3k_RFAConv(C3):
