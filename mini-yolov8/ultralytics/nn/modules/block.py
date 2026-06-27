@@ -55,6 +55,7 @@ __all__ = (
     "DSConv",
     "GAM",
     "GCBlock",
+    "GCConv",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -762,6 +763,31 @@ class GCBlock(nn.Module):
         """Recalibrate features with global context while preserving residual content."""
         x = self.proj(x)
         return x + self.channel_add(self.spatial_pool(x))
+
+
+class GCConv(nn.Module):
+    """Convolution followed by GCBlock for context-guided downsampling or feature projection."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int = 1,
+        s: int = 1,
+        p: int | None = None,
+        g: int = 1,
+        d: int = 1,
+        act: bool = True,
+        ratio: float = 0.25,
+    ):
+        """Initialize GCConv with Conv-compatible arguments."""
+        super().__init__()
+        self.conv = Conv(c1, c2, k, s, p, g, d, act)
+        self.gc = GCBlock(c2, c2, ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply convolution then global-context recalibration."""
+        return self.gc(self.conv(x))
 
 
 class Bottleneck_RFAConv(nn.Module):
