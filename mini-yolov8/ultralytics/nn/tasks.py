@@ -92,6 +92,7 @@ from ultralytics.nn.modules import (
     Segment,
     Segment26,
     SemanticSegment,
+    StripEnhance,
     TorchVision,
     VoVGSCSP,
     WorldDetect,
@@ -1821,6 +1822,9 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is DySample:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is StripEnhance:
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is ASFF2:

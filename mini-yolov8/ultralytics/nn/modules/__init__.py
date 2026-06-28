@@ -83,6 +83,7 @@ from .block import (
     SCDown,
     SEAM,
     SNIFuse2,
+    StripEnhance,
     TorchVision,
 )
 from .conv import (
@@ -235,6 +236,7 @@ __all__ = (
     "SCDown",
     "SEAM",
     "SNIFuse2",
+    "StripEnhance",
     "Segment",
     "Segment26",
     "SemanticSegment",

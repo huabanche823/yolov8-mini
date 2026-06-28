@@ -75,6 +75,7 @@ __all__ = (
     "SCDown",
     "SEAM",
     "SNIFuse2",
+    "StripEnhance",
     "FreqFusionLite",
     "TorchVision",
 )
@@ -694,6 +695,47 @@ class SPDConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Rearrange neighboring pixels into channels, then convolve."""
         return self.conv(torch.cat((x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]), 1))
+
+
+class StripEnhance(nn.Module):
+    """Residual strip feature enhancement for thin and elongated objects."""
+
+    def __init__(self, c1: int, k: int = 7, reduction: int = 4, init_alpha: float = 0.0):
+        """Initialize StripEnhance.
+
+        Args:
+            c1 (int): Input and output channels.
+            k (int): Strip kernel size for horizontal and vertical depthwise branches.
+            reduction (int): Channel reduction ratio.
+            init_alpha (float): Initial residual scale. Zero starts as an identity mapping.
+        """
+        super().__init__()
+        hidden = max(c1 // reduction, 16)
+        pad = k // 2
+        self.reduce = Conv(c1, hidden, 1, 1)
+        self.local = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.h_strip = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (1, k), 1, (0, pad), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.v_strip = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (k, 1), 1, (pad, 0), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.expand = Conv(hidden, c1, 1, 1, act=False)
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Enhance line-like structures while preserving the original feature path."""
+        y = self.reduce(x)
+        y = self.local(y) + self.h_strip(y) + self.v_strip(y)
+        return x + self.alpha * self.expand(y)
 
 
 class DySample(nn.Module):
