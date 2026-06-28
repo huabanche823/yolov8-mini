@@ -56,6 +56,7 @@ from ultralytics.nn.modules import (
     CoordAtt,
     Detect,
     DLU,
+    DySample,
     DyHeadLiteDetect,
     DWConv,
     DWConvTranspose2d,
@@ -1817,6 +1818,9 @@ def parse_model(d, ch, verbose=True):
         elif m is AIFI:
             args = [ch[f], *args]
         elif m is DLU:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is DySample:
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is ASFF2:

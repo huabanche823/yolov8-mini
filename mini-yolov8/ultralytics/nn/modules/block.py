@@ -54,6 +54,7 @@ __all__ = (
     "DDFMLite",
     "DLU",
     "DSConv",
+    "DySample",
     "GAM",
     "GCBlock",
     "GCConv",
@@ -693,6 +694,69 @@ class SPDConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Rearrange neighboring pixels into channels, then convolve."""
         return self.conv(torch.cat((x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]), 1))
+
+
+class DySample(nn.Module):
+    """Dynamic upsampling by learning sampling offsets for neck feature alignment."""
+
+    def __init__(self, c1: int, scale: int = 2, groups: int = 4, dyscope: bool = False):
+        """Initialize DySample.
+
+        Args:
+            c1 (int): Input and output channels.
+            scale (int): Upsampling scale factor.
+            groups (int): Sampling groups.
+            dyscope (bool): Whether to use a dynamic scope gate for offsets.
+        """
+        super().__init__()
+        self.scale = scale
+        self.groups = min(groups, c1)
+        while c1 % self.groups != 0:
+            self.groups -= 1
+        self.offset = nn.Conv2d(c1, 2 * self.groups * scale * scale, 1)
+        nn.init.normal_(self.offset.weight, std=0.001)
+        nn.init.constant_(self.offset.bias, 0)
+        self.scope = nn.Conv2d(c1, 2 * self.groups * scale * scale, 1) if dyscope else None
+        if self.scope is not None:
+            nn.init.constant_(self.scope.weight, 0)
+            nn.init.constant_(self.scope.bias, 0)
+        self.register_buffer("init_pos", self._init_pos())
+
+    def _init_pos(self) -> torch.Tensor:
+        """Create initial regular sampling offsets within each upsampled cell."""
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        yy, xx = torch.meshgrid(h, h, indexing="ij")
+        pos = torch.stack((xx, yy), 0).reshape(2, -1, 1, 1).repeat(1, self.groups, 1, 1)
+        return pos.reshape(1, -1, 1, 1)
+
+    def _sample(self, x: torch.Tensor, offset: torch.Tensor) -> torch.Tensor:
+        """Sample input features with learned offsets."""
+        b, _, h, w = offset.shape
+        offset = offset.view(b, 2, -1, h, w)
+        coords_h = torch.arange(h, dtype=x.dtype, device=x.device) + 0.5
+        coords_w = torch.arange(w, dtype=x.dtype, device=x.device) + 0.5
+        yy, xx = torch.meshgrid(coords_h, coords_w, indexing="ij")
+        coords = torch.stack((xx, yy), 0).unsqueeze(0).unsqueeze(2)
+        normalizer = torch.tensor([w, h], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+        coords = F.pixel_shuffle(coords.view(b, -1, h, w), self.scale)
+        coords = coords.view(b, 2, -1, self.scale * h, self.scale * w).permute(0, 2, 3, 4, 1).contiguous()
+        coords = coords.flatten(0, 1)
+        return F.grid_sample(
+            x.reshape(b * self.groups, -1, h, w),
+            coords,
+            mode="bilinear",
+            align_corners=False,
+            padding_mode="border",
+        ).view(b, -1, self.scale * h, self.scale * w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply dynamic sampling upsampling."""
+        if self.scope is None:
+            offset = self.offset(x) * 0.25 + self.init_pos
+        else:
+            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        return self._sample(x, offset)
 
 
 class MSBlock(nn.Module):
