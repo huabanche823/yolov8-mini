@@ -42,6 +42,7 @@ from ultralytics.nn.modules import (
     C3k2_DDFM,
     C3k2_DSConv,
     C3k2_EMA,
+    C3k2_GCResidual,
     C3k2_MSBlock,
     C3k2_RFAConv,
     C3x,
@@ -61,6 +62,7 @@ from ultralytics.nn.modules import (
     ESEDetect,
     FreqFusionLite,
     Focus,
+    GSConv,
     GAM,
     GCBlock,
     GCConv,
@@ -90,6 +92,7 @@ from ultralytics.nn.modules import (
     Segment26,
     SemanticSegment,
     TorchVision,
+    VoVGSCSP,
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
@@ -1698,6 +1701,7 @@ def parse_model(d, ch, verbose=True):
         {
             Classify,
             Conv,
+            GSConv,
             ConvTranspose,
             GhostConv,
             Bottleneck,
@@ -1717,6 +1721,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
+            C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
             RepNCSPELAN4,
@@ -1744,6 +1749,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             MFAM,
             A2C2f,
+            VoVGSCSP,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1756,6 +1762,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
+            C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
             C2fAttn,
@@ -1769,6 +1776,7 @@ def parse_model(d, ch, verbose=True):
             C2PSA,
             MFAM,
             A2C2f,
+            VoVGSCSP,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1796,7 +1804,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_MSBlock, C3k2_RFAConv}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_GCResidual, C3k2_MSBlock, C3k2_RFAConv}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True

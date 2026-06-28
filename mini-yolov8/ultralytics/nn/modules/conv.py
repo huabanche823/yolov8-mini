@@ -19,11 +19,14 @@ __all__ = (
     "DWConv",
     "DWConvTranspose2d",
     "Focus",
+    "GSBottleneck",
+    "GSConv",
     "GhostConv",
     "Index",
     "LightConv",
     "RepConv",
     "SpatialAttention",
+    "VoVGSCSP",
 )
 
 
@@ -197,6 +200,64 @@ class DWConv(Conv):
             act (bool | nn.Module): Activation function.
         """
         super().__init__(c1, c2, k, s, g=math.gcd(c1, c2), d=d, act=act)
+
+
+class GSConv(nn.Module):
+    """GSConv layer used by Slim-Neck for lightweight neck feature fusion."""
+
+    def __init__(self, c1, c2, k=1, s=1, g=1, act=True):
+        """Initialize GSConv with a standard branch and a depthwise branch."""
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+
+    def forward(self, x):
+        """Apply GSConv and channel shuffle."""
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        b, c, h, w = x2.size()
+        return x2.reshape(b, 2, c // 2, h, w).permute(0, 2, 1, 3, 4).reshape(b, c, h, w)
+
+
+class GSBottleneck(nn.Module):
+    """Lightweight bottleneck based on GSConv for neck fusion blocks."""
+
+    def __init__(self, c1, c2, e=0.5):
+        """Initialize a GSConv bottleneck with a shortcut projection."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.conv_lighting = nn.Sequential(GSConv(c1, c_, 1, 1), GSConv(c_, c2, 3, 1, act=False))
+        self.shortcut = Conv(c1, c2, 1, 1, act=False)
+
+    def forward(self, x):
+        """Apply bottleneck and shortcut."""
+        return self.conv_lighting(x) + self.shortcut(x)
+
+
+class VoVGSCSP(nn.Module):
+    """VoV-GSCSP block from Slim-Neck, adapted as a drop-in neck fusion block."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, e=0.5):
+        """Initialize VoVGSCSP.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of internal GSBottleneck blocks.
+            shortcut (bool): Kept for YAML compatibility.
+            e (float): Expansion ratio for hidden channels.
+        """
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.gsb = nn.Sequential(*(GSBottleneck(c_, c_, e=1.0) for _ in range(n)))
+        self.cv3 = Conv(2 * c_, c2, 1, 1)
+
+    def forward(self, x):
+        """Fuse two CSP branches with GSConv bottlenecks."""
+        return self.cv3(torch.cat((self.gsb(self.cv1(x)), self.cv2(x)), 1))
 
 
 class DWConvTranspose2d(nn.ConvTranspose2d):

@@ -43,6 +43,7 @@ __all__ = (
     "C3k2_DDFM",
     "C3k2_DSConv",
     "C3k2_EMA",
+    "C3k2_GCResidual",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
     "C3x",
@@ -1525,6 +1526,33 @@ class C3k2_MSBlock(C3k2):
             else Bottleneck_MSBlock(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
+
+
+class C3k2_GCResidual(C3k2):
+    """C3k2 with learnable residual global-context fusion at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        ratio: float = 0.25,
+        alpha_init: float = 0.1,
+    ):
+        """Initialize C3k2_GCResidual with the same core arguments as C3k2."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.gc = GCBlock(c2, c2, ratio)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then blend in global context with a learnable residual scale."""
+        y = super().forward(x)
+        return y + self.alpha * (self.gc(y) - y)
 
 
 class C3k2_DSConv(C3k2):
