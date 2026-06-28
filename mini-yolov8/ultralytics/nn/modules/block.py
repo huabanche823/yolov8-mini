@@ -38,6 +38,7 @@ __all__ = (
     "C2fAttn",
     "C2fCIB",
     "C2fPSA",
+    "PConvFasterC3k2",
     "C3Ghost",
     "C3k2",
     "C3k2_DDFM",
@@ -54,6 +55,7 @@ __all__ = (
     "DDFMLite",
     "DLU",
     "DSConv",
+    "DWRLite",
     "DySample",
     "GAM",
     "GCBlock",
@@ -507,6 +509,50 @@ class Bottleneck(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
+class PartialConv(nn.Module):
+    """Partial convolution that applies spatial convolution to only part of the channels."""
+
+    def __init__(self, c1: int, n_div: int = 4, k: int = 3):
+        """Initialize PartialConv.
+
+        Args:
+            c1 (int): Input and output channels.
+            n_div (int): Channel division factor. 4 means convolving one quarter of channels.
+            k (int): Spatial kernel size.
+        """
+        super().__init__()
+        self.dim_conv = max(c1 // n_div, 1)
+        self.dim_untouched = c1 - self.dim_conv
+        self.partial_conv = Conv(self.dim_conv, self.dim_conv, k, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spatial convolution to a channel subset and keep the rest unchanged."""
+        if self.dim_untouched == 0:
+            return self.partial_conv(x)
+        x1, x2 = torch.split(x, [self.dim_conv, self.dim_untouched], dim=1)
+        return torch.cat((self.partial_conv(x1), x2), 1)
+
+
+class Bottleneck_PConv(nn.Module):
+    """Bottleneck that replaces full spatial convolutions with a partial-convolution branch."""
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5, n_div: int = 4
+    ):
+        """Initialize a PConv bottleneck."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.pconv = PartialConv(c_, n_div=n_div, k=3)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply PConv bottleneck with optional shortcut."""
+        y = self.cv2(self.pconv(self.cv1(x)))
+        return x + y if self.add else y
+
+
 class RFAConv(nn.Module):
     """Receptive-field attention convolution.
 
@@ -736,6 +782,47 @@ class StripEnhance(nn.Module):
         y = self.reduce(x)
         y = self.local(y) + self.h_strip(y) + self.v_strip(y)
         return x + self.alpha * self.expand(y)
+
+
+class DWRLite(nn.Module):
+    """Lightweight dilation-wise residual block for local context enhancement."""
+
+    def __init__(self, c1: int, reduction: int = 4, init_alpha: float = 0.0, max_scale: float = 0.1):
+        """Initialize DWRLite.
+
+        Args:
+            c1 (int): Input and output channels.
+            reduction (int): Channel reduction ratio for the residual branch.
+            init_alpha (float): Initial residual scale parameter.
+            max_scale (float): Maximum residual strength after tanh scaling.
+        """
+        super().__init__()
+        hidden = max(c1 // reduction, 16)
+        self.reduce = Conv(c1, hidden, 1, 1)
+        self.dw1 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 1, dilation=1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.dw2 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 2, dilation=2, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.dw3 = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 3, dilation=3, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.expand = Conv(hidden * 3, c1, 1, 1, act=False)
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        self.max_scale = float(max_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bounded residual multi-dilation enhancement."""
+        y = self.reduce(x)
+        y = self.expand(torch.cat((self.dw1(y), self.dw2(y), self.dw3(y)), 1))
+        return x + self.max_scale * torch.tanh(self.alpha) * y
 
 
 class DySample(nn.Module):
@@ -1582,6 +1669,31 @@ class C3k2(C2f):
             else C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck(self.c, self.c, shortcut, g)
+            for _ in range(n)
+        )
+
+
+class PConvFasterC3k2(C3k2):
+    """C3k2 variant using partial-convolution bottlenecks for lightweight neck fusion."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        n_div: int = 4,
+    ):
+        """Initialize PConvFasterC3k2 with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_PConv(self.c, self.c, shortcut, g, e=1.0, n_div=n_div)
             for _ in range(n)
         )
 

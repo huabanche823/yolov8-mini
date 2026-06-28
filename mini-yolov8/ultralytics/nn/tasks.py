@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     C3k2_GCResidual,
     C3k2_MSBlock,
     C3k2_RFAConv,
+    PConvFasterC3k2,
     C3x,
     CBFuse,
     CBLinear,
@@ -56,6 +57,7 @@ from ultralytics.nn.modules import (
     CoordAtt,
     Detect,
     DLU,
+    DWRLite,
     DySample,
     DyHeadLiteDetect,
     DWConv,
@@ -1726,6 +1728,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
+            PConvFasterC3k2,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1767,6 +1770,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
+            PConvFasterC3k2,
             C2fAttn,
             C3,
             C3TR,
@@ -1806,7 +1810,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_GCResidual, C3k2_MSBlock, C3k2_RFAConv}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_GCResidual, C3k2_MSBlock, C3k2_RFAConv, PConvFasterC3k2}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
@@ -1825,6 +1829,9 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is StripEnhance:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is DWRLite:
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is ASFF2:
