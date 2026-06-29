@@ -65,6 +65,7 @@ from ultralytics.nn.modules import (
     DWConvTranspose2d,
     ESEDetect,
     FreqFusionLite,
+    FusionFactor,
     Focus,
     GSConv,
     GAM,
@@ -78,6 +79,7 @@ from ultralytics.nn.modules import (
     Index,
     LRPCHead,
     LSKBlock,
+    LineRefineLite,
     MFAM,
     MSBlock,
     Pose,
@@ -1833,6 +1835,12 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is DWRLite:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is LineRefineLite:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is FusionFactor:
             args = [ch[f], *args]
             c2 = ch[f]
         elif m is DASI2:

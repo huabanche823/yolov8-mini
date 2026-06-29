@@ -58,6 +58,7 @@ __all__ = (
     "DSConv",
     "DWRLite",
     "DySample",
+    "FusionFactor",
     "GAM",
     "GCBlock",
     "GCConv",
@@ -66,6 +67,7 @@ __all__ = (
     "HGStem",
     "ImagePoolingAttn",
     "LSKBlock",
+    "LineRefineLite",
     "MFAM",
     "MSBlock",
     "Proto",
@@ -865,6 +867,74 @@ class DASI2(nn.Module):
             fused.append(gate * det + (1.0 - gate) * sem)
 
         return self.act(self.bn(self.refine(torch.cat(fused, dim=1)) + detail))
+
+
+class FusionFactor(nn.Module):
+    """Learnable scalar gate for controlling top-down feature fusion strength."""
+
+    def __init__(self, c1: int, init: float = 0.75):
+        """Initialize FusionFactor.
+
+        Args:
+            c1 (int): Input and output channels.
+            init (float): Initial gate value in (0, 1).
+        """
+        super().__init__()
+        init_tensor = torch.tensor(float(init)).clamp(1e-4, 1.0 - 1e-4)
+        self.logit = nn.Parameter(torch.logit(init_tensor))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Scale the incoming feature map with a bounded learnable factor."""
+        return x * torch.sigmoid(self.logit)
+
+
+class LineRefineLite(nn.Module):
+    """Identity-preserving P4 refinement for thin line-like objects in the neck."""
+
+    def __init__(self, c1: int, k: int = 9, reduction: int = 8, max_scale: float = 0.2, init_alpha: float = 0.0):
+        """Initialize LineRefineLite.
+
+        Args:
+            c1 (int): Input and output channels.
+            k (int): Strip kernel size for horizontal and vertical depthwise branches.
+            reduction (int): Channel reduction ratio for the residual branch.
+            max_scale (float): Maximum residual scale after tanh bounding.
+            init_alpha (float): Initial residual scale. Zero starts as an identity mapping.
+        """
+        super().__init__()
+        hidden = max(c1 // reduction, 16)
+        pad = k // 2
+        self.reduce = Conv(c1, hidden, 1, 1)
+        self.local = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.h_line = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (1, k), 1, (0, pad), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.v_line = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (k, 1), 1, (pad, 0), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden, hidden, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.expand = Conv(hidden, c1, 1, 1, act=False)
+        self.alpha = nn.Parameter(torch.tensor(float(init_alpha)))
+        self.max_scale = float(max_scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bounded residual line refinement while preserving the original feature."""
+        y = self.reduce(x)
+        y = self.local(y) + self.h_line(y) + self.v_line(y)
+        y = self.expand(y * self.gate(y))
+        return x + self.max_scale * torch.tanh(self.alpha) * y
 
 
 class DySample(nn.Module):
