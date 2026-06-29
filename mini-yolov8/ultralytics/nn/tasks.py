@@ -55,6 +55,7 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     CoordAtt,
+    DASI2,
     Detect,
     DLU,
     DWRLite,
@@ -1834,6 +1835,11 @@ def parse_model(d, ch, verbose=True):
         elif m is DWRLite:
             args = [ch[f], *args]
             c2 = ch[f]
+        elif m is DASI2:
+            c1 = [ch[x] for x in f]
+            c2 = args[0]
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
         elif m is ASFF2:
             c1 = [ch[x] for x in f]
             args = [c1, *args]

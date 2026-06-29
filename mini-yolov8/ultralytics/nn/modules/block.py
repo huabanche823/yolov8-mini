@@ -53,6 +53,7 @@ __all__ = (
     "ContrastiveHead",
     "CoordAtt",
     "DDFMLite",
+    "DASI2",
     "DLU",
     "DSConv",
     "DWRLite",
@@ -823,6 +824,47 @@ class DWRLite(nn.Module):
         y = self.reduce(x)
         y = self.expand(torch.cat((self.dw1(y), self.dw2(y), self.dw3(y)), 1))
         return x + self.max_scale * torch.tanh(self.alpha) * y
+
+
+class DASI2(nn.Module):
+    """Two-input dimension-aware selective integration for lightweight neck fusion."""
+
+    def __init__(self, c1: list[int], c2: int, chunks: int = 4, refine: bool = False):
+        """Initialize DASI2.
+
+        Args:
+            c1 (list[int]): Input channels of [top-down, lateral] features.
+            c2 (int): Output channels after selective fusion.
+            chunks (int): Number of channel chunks used for selective integration.
+            refine (bool): Whether to use an extra 1x1 refinement after fusion.
+        """
+        super().__init__()
+        if not isinstance(c1, (list, tuple)) or len(c1) != 2:
+            raise ValueError("DASI2 expects exactly two input feature maps: [top-down, lateral].")
+        self.chunks = max(1, min(int(chunks), c2))
+        while c2 % self.chunks != 0:
+            self.chunks -= 1
+
+        self.semantic_proj = nn.Identity() if c1[0] == c2 else Conv(c1[0], c2, 1, 1, act=False)
+        self.detail_proj = nn.Identity() if c1[1] == c2 else Conv(c1[1], c2, 1, 1, act=False)
+        self.refine = Conv(c2, c2, 1, 1, act=False) if refine else nn.Identity()
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        """Fuse top-down semantic and lateral detail features with chunk-wise gates."""
+        semantic, detail = x
+        semantic = self.semantic_proj(semantic)
+        detail = self.detail_proj(detail)
+
+        semantic_chunks = torch.chunk(semantic, self.chunks, dim=1)
+        detail_chunks = torch.chunk(detail, self.chunks, dim=1)
+        fused = []
+        for sem, det in zip(semantic_chunks, detail_chunks):
+            gate = torch.sigmoid(det)
+            fused.append(gate * det + (1.0 - gate) * sem)
+
+        return self.act(self.bn(self.refine(torch.cat(fused, dim=1)) + detail))
 
 
 class DySample(nn.Module):
