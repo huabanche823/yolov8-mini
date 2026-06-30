@@ -52,6 +52,7 @@ from .block import (
     C3k2_GCResidual,
     C3k2_MSBlock,
     C3k2_RFAConv,
+    C3k2_SCConv,
     PConvFasterC3k2,
     C3x,
     CBFuse,
@@ -90,6 +91,7 @@ from .block import (
     SNIFuse2,
     StripEnhance,
     TorchVision,
+    WTConvDown,
 )
 from .conv import (
     CBAM,
@@ -183,6 +185,7 @@ __all__ = (
     "C3k2_GCResidual",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
+    "C3k2_SCConv",
     "PConvFasterC3k2",
     "C3x",
     "CBFuse",
@@ -252,6 +255,7 @@ __all__ = (
     "SemanticSegment",
     "SpatialAttention",
     "TorchVision",
+    "WTConvDown",
     "TransformerBlock",
     "TransformerEncoderLayer",
     "TransformerLayer",

@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     C3k2_GCResidual,
     C3k2_MSBlock,
     C3k2_RFAConv,
+    C3k2_SCConv,
     PConvFasterC3k2,
     C3x,
     CBFuse,
@@ -101,6 +102,7 @@ from ultralytics.nn.modules import (
     TorchVision,
     VoVGSCSP,
     WorldDetect,
+    WTConvDown,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
@@ -1731,7 +1733,9 @@ def parse_model(d, ch, verbose=True):
             C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
+            C3k2_SCConv,
             PConvFasterC3k2,
+            WTConvDown,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1773,6 +1777,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_GCResidual,
             C3k2_MSBlock,
             C3k2_RFAConv,
+            C3k2_SCConv,
             PConvFasterC3k2,
             C2fAttn,
             C3,
@@ -1813,7 +1818,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_GCResidual, C3k2_MSBlock, C3k2_RFAConv, PConvFasterC3k2}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_DDFM, C3k2_DSConv, C3k2_EMA, C3k2_GCResidual, C3k2_MSBlock, C3k2_RFAConv, C3k2_SCConv, PConvFasterC3k2}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True

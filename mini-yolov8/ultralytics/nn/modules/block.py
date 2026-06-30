@@ -47,6 +47,7 @@ __all__ = (
     "C3k2_GCResidual",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
+    "C3k2_SCConv",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -83,6 +84,7 @@ __all__ = (
     "StripEnhance",
     "FreqFusionLite",
     "TorchVision",
+    "WTConvDown",
 )
 
 
@@ -536,6 +538,43 @@ class PartialConv(nn.Module):
         return torch.cat((self.partial_conv(x1), x2), 1)
 
 
+class WTConvDown(nn.Module):
+    """Haar wavelet downsampling with lightweight frequency fusion for neck bottom-up paths."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 2):
+        """Initialize WTConvDown.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            k (int): Kernel size after wavelet decomposition.
+            s (int): Downsampling stride. Only stride 2 uses wavelet decomposition.
+        """
+        super().__init__()
+        self.stride = s
+        c_freq = c1 * 4 if s == 2 else c1
+        self.freq_dw = nn.Sequential(
+            nn.Conv2d(c_freq, c_freq, k, 1, autopad(k), groups=c_freq, bias=False),
+            nn.BatchNorm2d(c_freq),
+            nn.SiLU(inplace=True),
+        )
+        self.fuse = Conv(c_freq, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Haar low/high-frequency decomposition before convolution."""
+        if self.stride != 2:
+            return self.fuse(self.freq_dw(x))
+        x00 = x[..., 0::2, 0::2]
+        x01 = x[..., 0::2, 1::2]
+        x10 = x[..., 1::2, 0::2]
+        x11 = x[..., 1::2, 1::2]
+        ll = (x00 + x01 + x10 + x11) * 0.5
+        lh = (x00 - x01 + x10 - x11) * 0.5
+        hl = (x00 + x01 - x10 - x11) * 0.5
+        hh = (x00 - x01 - x10 + x11) * 0.5
+        return self.fuse(self.freq_dw(torch.cat((ll, lh, hl, hh), 1)))
+
+
 class Bottleneck_PConv(nn.Module):
     """Bottleneck that replaces full spatial convolutions with a partial-convolution branch."""
 
@@ -553,6 +592,102 @@ class Bottleneck_PConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply PConv bottleneck with optional shortcut."""
         y = self.cv2(self.pconv(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class SRULite(nn.Module):
+    """Spatial reconstruction unit from SCConv, simplified for lightweight neck use."""
+
+    def __init__(self, c1: int, groups: int = 16, gate_threshold: float = 0.5):
+        """Initialize SRULite."""
+        super().__init__()
+        groups = min(groups, c1)
+        while c1 % groups != 0:
+            groups -= 1
+        self.gn = nn.GroupNorm(groups, c1)
+        self.gate_threshold = float(gate_threshold)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Reconstruct spatially informative and less-informative responses."""
+        gamma = self.gn.weight / (self.gn.weight.sum() + 1e-6)
+        gate = torch.sigmoid(self.gn(x) * gamma.view(1, -1, 1, 1))
+        info = gate >= self.gate_threshold
+        keep = info * x
+        drop = (~info) * x
+        keep1, keep2 = torch.chunk(keep, 2, dim=1)
+        drop1, drop2 = torch.chunk(drop, 2, dim=1)
+        return torch.cat((keep1 + drop2, keep2 + drop1), dim=1)
+
+
+class CRULite(nn.Module):
+    """Channel reconstruction unit from SCConv with reduced grouped convolution."""
+
+    def __init__(self, c1: int, alpha: float = 0.5, squeeze: int = 2, groups: int = 2):
+        """Initialize CRULite."""
+        super().__init__()
+        upper = max(1, int(c1 * alpha))
+        lower = c1 - upper
+        if lower <= 0:
+            upper, lower = c1 // 2, c1 - c1 // 2
+        up_s = max(1, upper // squeeze)
+        low_s = max(1, lower // squeeze)
+        groups = min(groups, up_s)
+        while up_s % groups != 0:
+            groups -= 1
+
+        self.upper = upper
+        self.lower = lower
+        self.squeeze_up = nn.Conv2d(upper, up_s, 1, bias=False)
+        self.squeeze_low = nn.Conv2d(lower, low_s, 1, bias=False)
+        self.group_conv = nn.Conv2d(up_s, c1, 3, 1, 1, groups=groups, bias=False)
+        self.point_up = nn.Conv2d(up_s, c1, 1, bias=False)
+        self.point_low = nn.Conv2d(low_s, c1 - low_s, 1, bias=False)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Reconstruct channel responses and suppress redundancy."""
+        up, low = torch.split(x, [self.upper, self.lower], dim=1)
+        up = self.squeeze_up(up)
+        low = self.squeeze_low(low)
+        y1 = self.group_conv(up) + self.point_up(up)
+        y2 = torch.cat((self.point_low(low), low), dim=1)
+        y = torch.cat((y1, y2), dim=1)
+        y = y * F.softmax(self.pool(y), dim=1)
+        y1, y2 = torch.chunk(y, 2, dim=1)
+        return y1 + y2
+
+
+class SCConvLite(nn.Module):
+    """Spatial and channel reconstruction convolution for redundant neck features."""
+
+    def __init__(self, c1: int, groups: int = 16, gate_threshold: float = 0.5, alpha: float = 0.5, squeeze: int = 2):
+        """Initialize SCConvLite."""
+        super().__init__()
+        self.sru = SRULite(c1, groups=groups, gate_threshold=gate_threshold)
+        self.cru = CRULite(c1, alpha=alpha, squeeze=squeeze)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spatial and channel reconstruction."""
+        return self.cru(self.sru(x))
+
+
+class Bottleneck_SCConv(nn.Module):
+    """Bottleneck that uses SCConvLite for redundancy-aware neck feature refinement."""
+
+    def __init__(
+        self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5, groups: int = 16
+    ):
+        """Initialize Bottleneck_SCConv."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.scconv = SCConvLite(c_, groups=groups)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply SCConv bottleneck with optional shortcut."""
+        y = self.cv2(self.scconv(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -1806,6 +1941,31 @@ class PConvFasterC3k2(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_PConv(self.c, self.c, shortcut, g, e=1.0, n_div=n_div)
+            for _ in range(n)
+        )
+
+
+class C3k2_SCConv(C3k2):
+    """C3k2 variant using SCConvLite bottlenecks for redundancy-aware neck fusion."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        groups: int = 16,
+    ):
+        """Initialize C3k2_SCConv with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_SCConv(self.c, self.c, shortcut, g, e=1.0, groups=groups)
             for _ in range(n)
         )
 
