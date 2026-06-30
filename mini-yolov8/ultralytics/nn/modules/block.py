@@ -29,6 +29,8 @@ __all__ = (
     "AConv",
     "ADown",
     "AFPNFuse2",
+    "AFFFuse2",
+    "BiFPNAdd2",
     "Attention",
     "ASFF2",
     "BNContrastiveHead",
@@ -36,15 +38,19 @@ __all__ = (
     "BottleneckCSP",
     "C2f",
     "C2fAttn",
+    "CARAFEUpsample",
+    "GatedConcat",
     "C2fCIB",
     "C2fPSA",
     "PConvFasterC3k2",
     "C3Ghost",
     "C3k2",
+    "C3k2PKI",
     "C3k2_DDFM",
     "C3k2_DSConv",
     "C3k2_EMA",
     "C3k2_GCResidual",
+    "C3k2_GRN",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
     "C3k2_SCConv",
@@ -56,6 +62,11 @@ __all__ = (
     "DDFMLite",
     "DASI2",
     "DLU",
+    "ECALayer",
+    "SimAM",
+    "TripletAttention",
+    "TripletAttentionGate",
+    "ZPool",
     "DSConv",
     "DWRLite",
     "DySample",
@@ -350,6 +361,119 @@ class C2f(nn.Module):
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+
+class GatedConcat(nn.Module):
+    """Concatenate feature branches after lightweight channel gating."""
+
+    def __init__(self, c1: list[int], dimension: int = 1, reduction: int = 16):
+        """Initialize branch-wise channel gates."""
+        super().__init__()
+        self.d = dimension
+        self.gates = nn.ModuleList()
+        for c in c1:
+            hidden = max(c // reduction, 8)
+            self.gates.append(
+                nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Conv2d(c, hidden, 1, bias=True),
+                    nn.SiLU(inplace=True),
+                    nn.Conv2d(hidden, c, 1, bias=True),
+                    nn.Sigmoid(),
+                )
+            )
+
+    def forward(self, xs: list[torch.Tensor]) -> torch.Tensor:
+        """Gate each input branch, then concatenate."""
+        return torch.cat([x * gate(x) for x, gate in zip(xs, self.gates)], self.d)
+
+
+class CARAFEUpsample(nn.Module):
+    """Content-aware reassembly upsampling from CARAFE."""
+
+    def __init__(self, c1: int, scale: int = 2, encoder_kernel: int = 3, up_kernel: int = 5, compressed_channels: int = 64):
+        """Initialize CARAFE upsampling."""
+        super().__init__()
+        self.scale = scale
+        self.up_kernel = up_kernel
+        cm = min(compressed_channels, c1)
+        self.comp = Conv(c1, cm, 1, 1)
+        self.enc = nn.Conv2d(cm, (scale * up_kernel) ** 2, encoder_kernel, 1, encoder_kernel // 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply content-aware feature reassembly."""
+        b, c, h, w = x.shape
+        mask = self.enc(self.comp(x))
+        mask = F.pixel_shuffle(mask, self.scale)
+        mask = F.softmax(mask.view(b, self.up_kernel * self.up_kernel, h * self.scale, w * self.scale), dim=1)
+        x_up = F.interpolate(x, scale_factor=self.scale, mode="nearest")
+        pad = self.up_kernel // 2
+        patches = F.unfold(F.pad(x_up, (pad, pad, pad, pad)), self.up_kernel)
+        patches = patches.view(b, c, self.up_kernel * self.up_kernel, h * self.scale, w * self.scale)
+        return (patches * mask.unsqueeze(1)).sum(dim=2)
+
+
+class MBConvBlock(nn.Module):
+    """Mobile inverted bottleneck block for lightweight neck processing."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, expansion: float = 1.0):
+        """Initialize MBConvBlock."""
+        super().__init__()
+        hidden = max(int(c1 * expansion), 8)
+        self.use_res = shortcut and c1 == c2
+        self.conv = nn.Sequential(
+            Conv(c1, hidden, 1, 1),
+            nn.Conv2d(hidden, hidden, 3, 1, 1, groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            Conv(hidden, c2, 1, 1, act=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply inverted bottleneck with optional residual."""
+        y = self.conv(x)
+        return x + y if self.use_res else y
+
+
+class C2fMBConv(C2f):
+    """C2f block using lightweight MBConv bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, expansion: float = 1.0, e: float = 0.5):
+        """Initialize C2fMBConv."""
+        super().__init__(c1, c2, n, shortcut, 1, e)
+        self.m = nn.ModuleList(MBConvBlock(self.c, self.c, shortcut, expansion) for _ in range(n))
+
+
+class FusedMBConvBlock(nn.Module):
+    """EfficientNetV2 fused inverted bottleneck block for neck processing."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, expansion: float = 1.0):
+        """Initialize FusedMBConvBlock."""
+        super().__init__()
+        hidden = max(int(c1 * expansion), 8)
+        self.use_res = shortcut and c1 == c2
+        self.conv = nn.Sequential(
+            Conv(c1, hidden, 3, 1),
+            Conv(hidden, c2, 1, 1, act=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply fused inverted bottleneck with optional residual."""
+        y = self.conv(x)
+        return x + y if self.use_res else y
+
+
+
+
+
+class C2fFusedMBConv(C2f):
+    """C2f block using EfficientNetV2 fused MBConv bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, expansion: float = 1.0, e: float = 0.5):
+        """Initialize C2fFusedMBConv."""
+        super().__init__(c1, c2, n, shortcut, 1, e)
+        self.m = nn.ModuleList(FusedMBConvBlock(self.c, self.c, shortcut, expansion) for _ in range(n))
 
 
 class C3(nn.Module):
@@ -1920,6 +2044,69 @@ class C3k2(C2f):
         )
 
 
+
+
+class ContextAnchorAttention(nn.Module):
+    """Light context-anchor attention inspired by recent poly-kernel neck designs."""
+
+    def __init__(self, c: int, k: int = 11):
+        super().__init__()
+        hidden = max(c // 4, 16)
+        pad = k // 2
+        self.pool = nn.AvgPool2d(7, stride=1, padding=3)
+        self.reduce = Conv(c, hidden, 1, 1)
+        self.h_conv = nn.Conv2d(hidden, hidden, (1, k), 1, (0, pad), groups=hidden, bias=False)
+        self.v_conv = nn.Conv2d(hidden, hidden, (k, 1), 1, (pad, 0), groups=hidden, bias=False)
+        self.expand = nn.Conv2d(hidden, c, 1)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.pool(x)
+        y = self.reduce(y)
+        y = self.h_conv(y)
+        y = self.v_conv(y)
+        return self.act(self.expand(y))
+
+
+class PolyKernelInceptionBlock(nn.Module):
+    """Parallel depthwise poly-kernel block for multi-scale neck refinement."""
+
+    def __init__(self, c: int, shortcut: bool = True):
+        super().__init__()
+        self.shortcut = shortcut
+        self.pre = Conv(c, c, 1, 1)
+        self.dw3 = nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=False)
+        self.dw5 = nn.Conv2d(c, c, 5, 1, 2, groups=c, bias=False)
+        self.dw7 = nn.Conv2d(c, c, 7, 1, 3, groups=c, bias=False)
+        self.bn = nn.BatchNorm2d(c * 3)
+        self.fuse = Conv(c * 3, c, 1, 1)
+        self.attn = ContextAnchorAttention(c)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.pre(x)
+        y = torch.cat((self.dw3(y), self.dw5(y), self.dw7(y)), 1)
+        y = self.fuse(self.bn(y))
+        y = y * self.attn(y)
+        return x + y if self.shortcut else y
+
+
+class C3k2PKI(C3k2):
+    """C3k2 neck variant with lightweight poly-kernel inception blocks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(PolyKernelInceptionBlock(self.c, shortcut) for _ in range(n))
+
 class PConvFasterC3k2(C3k2):
     """C3k2 variant using partial-convolution bottlenecks for lightweight neck fusion."""
 
@@ -2043,6 +2230,32 @@ class C3k2_GCResidual(C3k2):
         """Apply C3k2, then blend in global context with a learnable residual scale."""
         y = super().forward(x)
         return y + self.alpha * (self.gc(y) - y)
+
+
+class GRNLayer(nn.Module):
+    """Global Response Normalization from ConvNeXt V2 for lightweight channel competition."""
+
+    def __init__(self, c1, eps=1e-6):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1, c1, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c1, 1, 1))
+        self.eps = eps
+
+    def forward(self, x):
+        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        return x + self.gamma * (x * nx) + self.beta
+
+
+class C3k2_GRN(C3k2):
+    """C3k2 neck block with lightweight global response normalization."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True):
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.grn = GRNLayer(c2)
+
+    def forward(self, x):
+        return self.grn(super().forward(x))
 
 
 class C3k2_DSConv(C3k2):
@@ -2198,6 +2411,195 @@ class AFPNFuse2(nn.Module):
         weight_1 = self.weight1(x1)
         weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
         return self.refine(x0 * weights[:, 0:1] + x1 * weights[:, 1:2])
+
+
+class ZPool(nn.Module):
+    """Channel max-average pooling used by TripletAttention."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool channel statistics into a two-channel descriptor."""
+        return torch.cat((torch.max(x, 1, keepdim=True)[0], torch.mean(x, 1, keepdim=True)), dim=1)
+
+
+class TripletAttentionGate(nn.Module):
+    """One branch of convolutional triplet attention."""
+
+    def __init__(self, kernel_size: int = 7):
+        """Initialize a spatial attention gate over pooled descriptors."""
+        super().__init__()
+        assert kernel_size % 2 == 1, "TripletAttention kernel size must be odd"
+        self.compress = ZPool()
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, bias=False),
+            nn.BatchNorm2d(1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply attention gate."""
+        scale = torch.sigmoid(self.spatial(self.compress(x)))
+        return x * scale
+
+
+class TripletAttention(nn.Module):
+    """Convolutional triplet attention for cross-dimension neck feature calibration."""
+
+    def __init__(self, c1: int, kernel_size: int = 7, no_spatial: bool = False):
+        """Initialize TripletAttention.
+
+        Args:
+            c1 (int): Input channels, kept for YAML parser compatibility.
+            kernel_size (int): Spatial kernel size in each attention gate.
+            no_spatial (bool): Whether to omit the H-W spatial branch.
+        """
+        super().__init__()
+        self.cw = TripletAttentionGate(kernel_size)
+        self.hc = TripletAttentionGate(kernel_size)
+        self.hw = None if no_spatial else TripletAttentionGate(kernel_size)
+        self.no_spatial = no_spatial
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply three-branch cross-dimension attention."""
+        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
+        x_out1 = self.cw(x_perm1).permute(0, 2, 1, 3).contiguous()
+        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
+        x_out2 = self.hc(x_perm2).permute(0, 3, 2, 1).contiguous()
+        if self.no_spatial:
+            return 0.5 * (x_out1 + x_out2)
+        return (x_out1 + x_out2 + self.hw(x)) / 3.0
+
+
+class SimAM(nn.Module):
+    """Parameter-free simple attention module for feature energy calibration."""
+
+    def __init__(self, c1: int, e_lambda: float = 1e-4):
+        """Initialize SimAM.
+
+        Args:
+            c1 (int): Input channels, kept for YAML parser compatibility.
+            e_lambda (float): Stability term in the energy function.
+        """
+        super().__init__()
+        self.e_lambda = e_lambda
+        self.activation = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply parameter-free attention from feature variance energy."""
+        n = x.shape[2] * x.shape[3] - 1
+        x_minus_mu_square = (x - x.mean(dim=(2, 3), keepdim=True)).pow(2)
+        denom = 4 * (x_minus_mu_square.sum(dim=(2, 3), keepdim=True) / max(n, 1) + self.e_lambda)
+        return x * self.activation(x_minus_mu_square / denom + 0.5)
+
+
+class ECALayer(nn.Module):
+    """Efficient Channel Attention for lightweight neck feature recalibration."""
+
+    def __init__(self, c1: int, k_size: int = 3):
+        """Initialize ECA with local cross-channel interaction."""
+        super().__init__()
+        assert k_size % 2 == 1, "ECALayer kernel size must be odd"
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply efficient channel attention."""
+        y = self.avg_pool(x).squeeze(-1).transpose(-1, -2)
+        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
+        return x * self.sigmoid(y)
+
+
+class AFFFuse2(nn.Module):
+    """Two-input attentional feature fusion for YOLO necks.
+
+    AFFFuse2 aligns two adjacent-scale features to a shared channel width, then
+    predicts local and global fusion weights from their sum. Unlike static BiFPN
+    weights, the branch weight is input-adaptive for each image and spatial cell.
+    """
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, reduction: int = 4):
+        """Initialize AFFFuse2.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of two input feature maps.
+            c2 (int): Output channel count after alignment and fusion.
+            reduction (int): Channel reduction ratio for attention bottlenecks.
+        """
+        super().__init__()
+        assert len(channels) == 2, "AFFFuse2 expects exactly two input feature maps"
+        c1, c1_b = channels
+        inter = max(c2 // reduction, 8)
+        self.align0 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.align1 = Conv(c1_b, c2, 1, 1) if c1_b != c2 else nn.Identity()
+        self.local_att = nn.Sequential(
+            nn.Conv2d(c2, inter, 1, bias=False),
+            nn.BatchNorm2d(inter),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(inter, c2, 1, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        self.global_att = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c2, inter, 1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(inter, c2, 1, bias=False),
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    @staticmethod
+    def _resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Resize feature map to target size when adjacent scales differ."""
+        return x if x.shape[-2:] == size else F.interpolate(x, size=size, mode="nearest")
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two features with attentional branch weights."""
+        x0, x1 = x
+        x0 = self._resize(x0, x1.shape[-2:])
+        x0, x1 = self.align0(x0), self.align1(x1)
+        xa = x0 + x1
+        weight = self.sigmoid(self.local_att(xa) + self.global_att(xa))
+        return 2.0 * x0 * weight + 2.0 * x1 * (1.0 - weight)
+
+
+class BiFPNAdd2(nn.Module):
+    """Two-input weighted BiFPN-style feature fusion.
+
+    This block replaces channel concatenation with normalized learnable weights.
+    It keeps the output channel count fixed, which reduces the following C3k2
+    input width while preserving bidirectional multi-scale fusion behavior.
+    """
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, eps: float = 1e-4, refine: bool = True):
+        """Initialize BiFPNAdd2.
+
+        Args:
+            channels (list[int] | tuple[int, int]): Channel counts of the two input feature maps.
+            c2 (int): Output channel count after channel alignment and fusion.
+            eps (float): Numerical stability term for weight normalization.
+            refine (bool): Whether to refine the fused feature with a lightweight depthwise convolution.
+        """
+        super().__init__()
+        assert len(channels) == 2, "BiFPNAdd2 expects exactly two input feature maps"
+        c1, c1_b = channels
+        self.align0 = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.align1 = Conv(c1_b, c2, 1, 1) if c1_b != c2 else nn.Identity()
+        self.w = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.eps = eps
+        self.refine = DWConv(c2, c2, 3, 1) if refine else nn.Identity()
+
+    @staticmethod
+    def _resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Resize feature map to target size when adjacent scales differ."""
+        return x if x.shape[-2:] == size else F.interpolate(x, size=size, mode="nearest")
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse two adjacent-scale feature maps with normalized positive weights."""
+        x0, x1 = x
+        size = x1.shape[-2:]
+        x0 = self._resize(x0, size)
+        x0, x1 = self.align0(x0), self.align1(x1)
+        w = F.relu(self.w)
+        w = w / (w.sum() + self.eps)
+        return self.refine(w[0] * x0 + w[1] * x1)
 
 
 class SNIFuse2(nn.Module):

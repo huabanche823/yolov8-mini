@@ -15,7 +15,7 @@ def main():
     print(f"ultralytics source: {ultralytics.__file__}")
     # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
     # 改进不要加载预训练权重
-    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11_fusionfactor_neck.yaml") 
+    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11_triplet_neck.yaml") 
     results = model.train(
         data=ROOT / "datasets/WasteSortingv3/data_challenge.yaml",  # 数据集配置文件路径
         epochs=100,  # 训练轮数
@@ -27,7 +27,7 @@ def main():
         workers=4,  # 数据加载线程数，0 表示不使用子进程
         device=0,  # 使用 GPU 进行训练
         project=ROOT / "runs",  # 训练结果保存目录的父目录
-        name="WasteSortingv3_yolov11_fusionfactor_neck",  # 本次训练的实验名称
+        name="WasteSortingv3_yolov11_triplet_neck",  # 本次训练的实验名称
         exist_ok=True,  # 如果目录已存在，允许覆盖
         pretrained=False,  # 不使用预训练权重
         val=True,  # 训练时进行验证
