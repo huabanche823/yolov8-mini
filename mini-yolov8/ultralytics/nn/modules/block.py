@@ -45,9 +45,11 @@ __all__ = (
     "C3k2_DSConv",
     "C3k2_EMA",
     "C3k2_GCResidual",
+    "C3k2_InceptionNeXtLite",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
     "C3k2_SCConv",
+    "C3k2_StarBlockLite",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -688,6 +690,89 @@ class Bottleneck_SCConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply SCConv bottleneck with optional shortcut."""
         y = self.cv2(self.scconv(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class InceptionDWConvLite(nn.Module):
+    """InceptionNeXt-style split depthwise convolution for lightweight spatial mixing."""
+
+    def __init__(self, c1: int, square_k: int = 3, band_k: int = 11, branch_ratio: float = 0.125):
+        """Initialize InceptionDWConvLite."""
+        super().__init__()
+        gc = max(1, int(c1 * branch_ratio))
+        gc = min(gc, c1 // 4) if c1 >= 4 else 1
+        self.split_indexes = (c1 - 3 * gc, gc, gc, gc)
+        self.dw_square = nn.Conv2d(gc, gc, square_k, 1, square_k // 2, groups=gc, bias=False)
+        self.dw_horizontal = nn.Conv2d(gc, gc, (1, band_k), 1, (0, band_k // 2), groups=gc, bias=False)
+        self.dw_vertical = nn.Conv2d(gc, gc, (band_k, 1), 1, (band_k // 2, 0), groups=gc, bias=False)
+        self.bn = nn.BatchNorm2d(c1)
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply split depthwise square, horizontal, and vertical convolutions."""
+        x_id, x_square, x_h, x_w = torch.split(x, self.split_indexes, dim=1)
+        x = torch.cat((x_id, self.dw_square(x_square), self.dw_horizontal(x_h), self.dw_vertical(x_w)), dim=1)
+        return self.act(self.bn(x))
+
+
+class Bottleneck_InceptionNeXtLite(nn.Module):
+    """Bottleneck using InceptionNeXt-lite spatial mixing instead of full 3x3 convolution."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_InceptionNeXtLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.mix = InceptionDWConvLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply InceptionNeXt-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.mix(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class StarBlockLite(nn.Module):
+    """StarNet-style lightweight spatial block with element-wise feature interaction."""
+
+    def __init__(self, c1: int):
+        """Initialize StarBlockLite."""
+        super().__init__()
+        self.dw = nn.Sequential(
+            nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.f1 = nn.Conv2d(c1, c1, 1, bias=False)
+        self.f2 = nn.Conv2d(c1, c1, 1, bias=False)
+        self.proj = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply StarNet-style multiplicative interaction."""
+        y = self.dw(x)
+        return self.proj(self.act(self.f1(y)) * self.f2(y))
+
+
+class Bottleneck_StarBlockLite(nn.Module):
+    """Bottleneck using StarBlock-lite for lightweight nonlinear spatial interaction."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_StarBlockLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.star = StarBlockLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply StarBlock-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.star(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -1966,6 +2051,54 @@ class C3k2_SCConv(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_SCConv(self.c, self.c, shortcut, g, e=1.0, groups=groups)
+            for _ in range(n)
+        )
+
+
+class C3k2_InceptionNeXtLite(C3k2):
+    """C3k2 variant using InceptionNeXt-lite bottlenecks for bottom-up neck spatial mixing."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_InceptionNeXtLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_InceptionNeXtLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_StarBlockLite(C3k2):
+    """C3k2 variant using StarBlock-lite bottlenecks for bottom-up neck feature interaction."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_StarBlockLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_StarBlockLite(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
