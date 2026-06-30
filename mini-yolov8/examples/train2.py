@@ -15,7 +15,7 @@ def main():
     print(f"ultralytics source: {ultralytics.__file__}")
     # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
     # 改进不要加载预训练权重
-    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11.yaml") 
+    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11_linerefine_p4_neck.yaml") 
     results = model.train(
         data=ROOT / "datasets/WasteSortingv3/data_challenge.yaml",  # 数据集配置文件路径
         epochs=100,  # 训练轮数
@@ -23,10 +23,11 @@ def main():
         batch=32,   
         lr0=0.01,  # 按缩放规则：0.01 * 32/16 = 0.02
         momentum=0.937,
+        weight_decay=0.0005,
         workers=4,  # 数据加载线程数，0 表示不使用子进程
         device=0,  # 使用 GPU 进行训练
         project=ROOT / "runs",  # 训练结果保存目录的父目录
-        name="WasteSortingv3_yolov11_challenge",  # 本次训练的实验名称
+        name="WasteSortingv3_yolov11_linerefine_p4_neck",  # 本次训练的实验名称
         exist_ok=True,  # 如果目录已存在，允许覆盖
         pretrained=False,  # 不使用预训练权重
         val=True,  # 训练时进行验证
@@ -37,6 +38,7 @@ def main():
         patience=20,     # 连续30个epoch验证集mAP50-95无有效提升，则触发早停停止训练
         seed=1,
         deterministic=False,
+        # bbox_loss="mpdiou", #指定IOUloss
         # mosaic=1.0,
         # close_mosaic=10,
         # mixup=0.5,
@@ -106,6 +108,18 @@ YOLOv11 summary (fused): 101 layers, 2,583,127 parameters, 0 gradients, 6.3 GFLO
                 timber        192        430      0.879      0.882      0.917      0.673
 Speed: 3.0ms preprocess, 2.0ms inference, 0.0ms loss, 5.1ms postprocess per image
 Results saved to /root/yolov8-mini/mini-yolov8/runs/WasteSortingv3_yolov11_challenge
+
+
+
+YOLOv11_gcblock summary (fused): 113 layers, 2,599,897 parameters, 0 gradients, 6.3 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100% ━━━━━━━━━━━━ 6/6 3.0it/s 2.0s
+                   all        355       1894      0.917      0.856      0.914      0.646
+                 Brick        219        399      0.949      0.925      0.961      0.697
+              Concrete        217        522       0.98      0.928      0.981      0.757
+        Plastic Bottle        129        231      0.878      0.813      0.873      0.556
+         Reinforcement        174        312      0.892      0.718      0.837       0.55
+                timber        192        430      0.889      0.893       0.92      0.668
+Speed: 0.9ms preprocess, 1.0ms inference, 0.0ms loss, 0.7ms postprocess per image
 
 
 """

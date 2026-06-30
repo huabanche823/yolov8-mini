@@ -30,15 +30,22 @@ from ultralytics.nn.modules import (
     AConv,
     ADown,
     AFPNFuse2,
+    AFFFuse2,
     ASFF2,
+    BiFPNAdd2,
     Bottleneck,
     BottleneckCSP,
+    CARAFEUpsample,
+    GatedConcat,
     C2f,
     C2fAttn,
     C2fCIB,
     C2fPSA,
+    C2fMBConv,
+    C2fFusedMBConv,
     C3Ghost,
     C3k2,
+    C3k2PKI,
     C3k2_DDFM,
     C3k2_DSConv,
     C3k2_EMA,
@@ -61,6 +68,9 @@ from ultralytics.nn.modules import (
     DASI2,
     Detect,
     DLU,
+    ECALayer,
+    SimAM,
+    TripletAttention,
     DWRLite,
     DySample,
     DyHeadLiteDetect,
@@ -1721,6 +1731,8 @@ def parse_model(d, ch, verbose=True):
             SPPF,
             SPDConv,
             C2fPSA,
+            C2fMBConv,
+    C2fFusedMBConv,
             C2PSA,
             DWConv,
             Focus,
@@ -1729,7 +1741,8 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
-            C3k2_DDFM,
+            C3k2PKI,
+                    C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
             C3k2_GCResidual,
@@ -1775,7 +1788,8 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
-            C3k2_DDFM,
+            C3k2PKI,
+                    C3k2_DDFM,
             C3k2_DSConv,
             C3k2_EMA,
             C3k2_GCResidual,
@@ -1792,6 +1806,8 @@ def parse_model(d, ch, verbose=True):
             C3x,
             RepC3,
             C2fPSA,
+            C2fMBConv,
+    C2fFusedMBConv,
             C2fCIB,
             C2PSA,
             MFAM,
@@ -1839,6 +1855,18 @@ def parse_model(d, ch, verbose=True):
         elif m is DLU:
             args = [ch[f], *args]
             c2 = ch[f]
+        elif m is ECALayer:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is SimAM:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is CARAFEUpsample:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m is TripletAttention:
+            args = [ch[f], *args]
+            c2 = ch[f]
         elif m is DySample:
             args = [ch[f], *args]
             c2 = ch[f]
@@ -1868,7 +1896,7 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
             args = [c1, c2, *args[1:]]
-        elif m in frozenset({SNIFuse2, FreqFusionLite}):
+        elif m in frozenset({AFFFuse2, BiFPNAdd2, SNIFuse2, FreqFusionLite}):
             c1 = [ch[x] for x in f]
             c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1885,6 +1913,10 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is GatedConcat:
+            c1 = [ch[x] for x in f]
+            c2 = sum(c1)
+            args = [c1, *args]
         elif m in frozenset(
             {
                 Detect,
