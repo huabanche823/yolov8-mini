@@ -51,8 +51,10 @@ __all__ = (
     "C3k2_EMA",
     "C3k2_GCResidual",
     "C3k2_InceptionNeXtLite",
+    "C3k2_MobileOneLite",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
+    "C3k2_RepMixerLite",
     "C3k2_SCConv",
     "C3k2_StarBlockLite",
     "C3x",
@@ -896,6 +898,93 @@ class Bottleneck_StarBlockLite(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply StarBlock-lite bottleneck with optional shortcut."""
         y = self.cv2(self.star(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class MobileOneBlockLite(nn.Module):
+    """MobileOne-style lightweight re-parameterizable local convolution block."""
+
+    def __init__(self, c1: int, branches: int = 2):
+        """Initialize MobileOneBlockLite."""
+        super().__init__()
+        self.dw_branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+            )
+            for _ in range(branches)
+        )
+        self.dw_1x1 = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, 1, 0, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.identity = nn.BatchNorm2d(c1)
+        self.pw = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply multi-branch local convolution and pointwise mixing."""
+        y = self.identity(x) + self.dw_1x1(x)
+        for branch in self.dw_branches:
+            y = y + branch(x)
+        return self.act(self.pw(self.act(y)))
+
+
+class Bottleneck_MobileOneLite(nn.Module):
+    """Bottleneck using MobileOne-lite local convolution for P4 neck refinement."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_MobileOneLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.mobileone = MobileOneBlockLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply MobileOne-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.mobileone(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class RepMixerLite(nn.Module):
+    """FastViT RepMixer-style local token mixing without attention or global pooling."""
+
+    def __init__(self, c1: int, k: int = 3):
+        """Initialize RepMixerLite."""
+        super().__init__()
+        self.norm = nn.BatchNorm2d(c1)
+        self.mixer = nn.Sequential(
+            nn.Conv2d(c1, c1, k, 1, k // 2, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.scale = nn.Parameter(torch.zeros(1, c1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply bounded residual local token mixing."""
+        y = self.norm(x)
+        return x + self.scale * (self.mixer(y) - y)
+
+
+class Bottleneck_RepMixerLite(nn.Module):
+    """Bottleneck using RepMixer-lite local token mixing for P4 neck refinement."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_RepMixerLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.mixer = RepMixerLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RepMixer-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.mixer(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -2285,6 +2374,54 @@ class C3k2_StarBlockLite(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_StarBlockLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_MobileOneLite(C3k2):
+    """C3k2 variant using MobileOne-lite bottlenecks for P4-only neck refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_MobileOneLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_MobileOneLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_RepMixerLite(C3k2):
+    """C3k2 variant using RepMixer-lite bottlenecks for P4-only neck refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_RepMixerLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_RepMixerLite(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
