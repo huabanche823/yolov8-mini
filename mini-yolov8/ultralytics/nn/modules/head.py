@@ -16,7 +16,7 @@ from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
-from .conv import Conv, DWConv
+from .conv import Conv, DWConv, GhostConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
@@ -26,6 +26,8 @@ __all__ = (
     "Detect",
     "DyHeadLiteDetect",
     "ESEDetect",
+    "GhostHeadDetect",
+    "LEDHDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
@@ -262,6 +264,100 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class GhostHeadDetect(Detect):
+    """YOLOv11 Detect head with GhostConv-based box regression branches.
+
+    The classification branch keeps the native YOLOv11 lightweight DWConv+1x1
+    design by default, while the heavier box branch is replaced with GhostConv
+    to reduce redundant convolutional computation in the detection head.
+    """
+
+    def __init__(
+        self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = (), ghost_cls: bool = False
+    ):
+        """Initialize GhostHeadDetect.
+
+        Args:
+            nc (int): Number of classes.
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from neck feature maps.
+            ghost_cls (bool): Replace classification branch convolutions with GhostConv when True.
+        """
+        super().__init__(nc, reg_max, False, ch)
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(GhostConv(x, c2, 3), GhostConv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        if ghost_cls:
+            self.cv3 = nn.ModuleList(
+                nn.Sequential(GhostConv(x, c3, 3), GhostConv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch
+            )
+
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class LEDHDetect(Detect):
+    """Lightweight Efficient Detection Head from SBP-YOLO for YOLOv11.
+
+    Each detection scale first uses two shared 3x3 grouped convolutions, then
+    separate 1x1 prediction layers produce box regression logits and class
+    scores. This keeps the change isolated to the detection head.
+    """
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize LEDHDetect."""
+        super().__init__(nc, reg_max, False, ch)
+        self.shared = nn.ModuleList(
+            nn.Sequential(Conv(x, x, 3, 1, g=max(1, x // 16)), Conv(x, x, 3, 1, g=max(1, x // 16))) for x in ch
+        )
+        self.cv2 = nn.ModuleList(nn.Sequential(nn.Conv2d(x, 4 * self.reg_max, 1)) for x in ch)
+        self.cv3 = nn.ModuleList(nn.Sequential(nn.Conv2d(x, self.nc, 1)) for x in ch)
+
+        if end2end:
+            self.one2one_shared = copy.deepcopy(self.shared)
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    @property
+    def one2many(self):
+        """Return the shared LEDH transform and prediction layers."""
+        return dict(shared_head=self.shared, box_head=self.cv2, cls_head=self.cv3)
+
+    @property
+    def one2one(self):
+        """Return the one-to-one LEDH transform and prediction layers."""
+        return dict(shared_head=self.one2one_shared, box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        shared_head: torch.nn.Module = None,
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Apply shared grouped convolutions before 1x1 box/class predictions."""
+        if shared_head is None or box_head is None or cls_head is None:
+            return dict()
+        bs = x[0].shape[0]
+        feats = [shared_head[i](x[i]) for i in range(self.nl)]
+        boxes = torch.cat([box_head[i](feats[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([cls_head[i](feats[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        return dict(boxes=boxes, scores=scores, feats=feats)
+
+    def bias_init(self):
+        """Initialize LEDH prediction biases."""
+        for i, (a, b) in enumerate(zip(self.one2many["box_head"], self.one2many["cls_head"])):
+            a[-1].bias.data[:] = 2.0
+            b[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
+        if self.end2end:
+            for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):
+                a[-1].bias.data[:] = 2.0
+                b[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
 
 
 class ESEAttn(nn.Module):
