@@ -54,6 +54,8 @@ __all__ = (
     "C3k2_MobileOneLite",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
+    "C3k2_RepHELANLite",
+    "C3k2_RepHMSLite",
     "C3k2_RepMixerLite",
     "C3k2_SCConv",
     "C3k2_StarBlockLite",
@@ -985,6 +987,100 @@ class Bottleneck_RepMixerLite(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RepMixer-lite bottleneck with optional shortcut."""
         y = self.cv2(self.mixer(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class RepHELANLite(nn.Module):
+    """RepHELAN-inspired heterogeneous local convolution for lightweight neck refinement."""
+
+    def __init__(self, c1: int):
+        """Initialize RepHELANLite with small and medium depthwise branches."""
+        super().__init__()
+        self.dw3 = nn.Sequential(
+            nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.dw5 = nn.Sequential(
+            nn.Conv2d(c1, c1, 5, 1, 2, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.identity = nn.BatchNorm2d(c1)
+        self.proj = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix heterogeneous local kernels with a lightweight projection."""
+        y = self.dw3(x) + self.dw5(x) + self.identity(x)
+        return self.act(self.proj(self.act(y)))
+
+
+class Bottleneck_RepHELANLite(nn.Module):
+    """CSP bottleneck using RepHELAN-lite heterogeneous convolution."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_RepHELANLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.rephelan = RepHELANLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RepHELAN-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.rephelan(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class RepHMSLite(nn.Module):
+    """RepHMS-inspired directional multi-scale convolution for elongated structures."""
+
+    def __init__(self, c1: int):
+        """Initialize RepHMSLite with square, horizontal, and vertical depthwise branches."""
+        super().__init__()
+        self.dw3 = nn.Sequential(
+            nn.Conv2d(c1, c1, 3, 1, 1, groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.dwh = nn.Sequential(
+            nn.Conv2d(c1, c1, (1, 5), 1, (0, 2), groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.dwv = nn.Sequential(
+            nn.Conv2d(c1, c1, (5, 1), 1, (2, 0), groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.identity = nn.BatchNorm2d(c1)
+        self.proj = nn.Sequential(
+            nn.Conv2d(c1, c1, 1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix square and directional kernels for line-like neck features."""
+        y = self.dw3(x) + self.dwh(x) + self.dwv(x) + self.identity(x)
+        return self.act(self.proj(self.act(y)))
+
+
+class Bottleneck_RepHMSLite(nn.Module):
+    """CSP bottleneck using RepHMS-lite directional multi-scale convolution."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_RepHMSLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.rephms = RepHMSLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RepHMS-lite bottleneck with optional shortcut."""
+        y = self.cv2(self.rephms(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -2374,6 +2470,54 @@ class C3k2_StarBlockLite(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_StarBlockLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_RepHELANLite(C3k2):
+    """C3k2 variant using RepHELAN-lite bottlenecks for P4 neck enhancement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_RepHELANLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_RepHELANLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_RepHMSLite(C3k2):
+    """C3k2 variant using RepHMS-lite bottlenecks for P4 directional neck enhancement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_RepHMSLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_RepHMSLite(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
