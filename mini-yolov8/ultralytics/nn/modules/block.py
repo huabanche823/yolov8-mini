@@ -53,6 +53,8 @@ __all__ = (
     "C3k2_EAConvLite",
     "C3k2_EMA",
     "C3k2_GCResidual",
+    "C3k2_CAAResidual",
+    "C3k2_SEResidual",
     "C3k2_InceptionNeXtLite",
     "C3k2_MobileOneLite",
     "C3k2_HorNetResidual",
@@ -2855,6 +2857,109 @@ class C3k2_GCResidual(C3k2):
         y = super().forward(x)
         alpha = self.alpha_logit.sigmoid()
         return y + alpha * (self.gc(y) - y)
+
+
+class SEContextLite(nn.Module):
+    """Lightweight squeeze-excitation context recalibration."""
+
+    def __init__(self, c1: int, reduction: int = 16):
+        """Initialize SEContextLite."""
+        super().__init__()
+        hidden = max(8, c1 // reduction)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.excite = nn.Sequential(
+            nn.Conv2d(c1, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Recalibrate channels using global average context."""
+        return x * self.excite(self.pool(x))
+
+
+class CAAContextLite(nn.Module):
+    """Context anchor attention with lightweight strip depthwise context."""
+
+    def __init__(self, c1: int, ratio: float = 0.125, k: int = 11):
+        """Initialize CAAContextLite."""
+        super().__init__()
+        hidden = max(8, int(c1 * ratio))
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.reduce = Conv(c1, hidden, 1, 1)
+        self.horizontal = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (1, k), 1, (0, k // 2), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.vertical = nn.Sequential(
+            nn.Conv2d(hidden, hidden, (k, 1), 1, (k // 2, 0), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        )
+        self.expand = nn.Conv2d(hidden, c1, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply anchor-style global context and strip attention."""
+        context = self.reduce(self.pool(x)).expand(-1, -1, x.shape[-2], x.shape[-1])
+        attn = torch.sigmoid(self.expand(self.vertical(self.horizontal(context))))
+        return x * attn
+
+
+class C3k2_SEResidual(C3k2):
+    """C3k2 followed by SE context recalibration at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        reduction: int = 16,
+        alpha_init: float = 1.0,
+    ):
+        """Initialize C3k2_SEResidual with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.se = SEContextLite(c2, reduction)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then directly recalibrate features with SE context."""
+        y = super().forward(x)
+        return self.se(y)
+
+
+class C3k2_CAAResidual(C3k2):
+    """C3k2 with learnable residual context-anchor attention fusion at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        ratio: float = 0.125,
+        alpha_init: float = 0.8,
+    ):
+        """Initialize C3k2_CAAResidual with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.caa = CAAContextLite(c2, ratio)
+        alpha_init = min(max(float(alpha_init), 1e-4), 1.0 - 1e-4)
+        self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(alpha_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then blend in CAA context with a bounded residual scale."""
+        y = super().forward(x)
+        alpha = self.alpha_logit.sigmoid()
+        return y + alpha * (self.caa(y) - y)
 
 
 class MogaBlockLite(nn.Module):

@@ -102,6 +102,8 @@ warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)
+cls_pos_only: False # (bool) apply class weights only to positive classification targets
+cls_hard_weights: # (list | null) manual class weights, e.g. [1.0, 1.0, 1.1, 1.25, 1.0]
 minority_oversample: False # (bool) enable online weighted sampling for minority detection classes
 dfl: 1.5 # (float) distribution focal loss gain
 bbox_loss: ciou # (str) bbox regression loss: ciou, wiou, mpdiou, shape_iou

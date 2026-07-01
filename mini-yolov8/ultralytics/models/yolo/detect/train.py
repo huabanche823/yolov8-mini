@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import random
 from copy import copy
+from ast import literal_eval
 from typing import Any
 
 import numpy as np
@@ -182,6 +183,17 @@ class DetectionTrainer(BaseTrainer):
         raised to the power of cls_pw (0 < cls_pw <= 1 dampens, cls_pw > 1 amplifies).
         Final weights are normalized so their mean equals 1.0.
         """
+        hard_weights = getattr(self.args, "cls_hard_weights", None)
+        if hard_weights is not None:
+            if isinstance(hard_weights, str):
+                hard_weights = literal_eval(hard_weights)
+            weights = np.asarray(hard_weights, dtype=np.float32)
+            if weights.size != self.data["nc"]:
+                raise ValueError(f"cls_hard_weights length {weights.size} does not match nc={self.data['nc']}")
+            self.model.class_weights = torch.from_numpy(weights).to(self.device)
+            LOGGER.info(f"Manual class weights: {self.model.class_weights.cpu().numpy().round(3)}")
+            return
+
         assert 0 <= self.args.cls_pw <= 1.0, "cls_pw must be in the range [0, 1]"
         if self.args.cls_pw == 0.0:
             return
