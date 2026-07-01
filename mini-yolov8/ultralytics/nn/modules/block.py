@@ -67,6 +67,7 @@ __all__ = (
     "C3k2_RepMixerLite",
     "C3k2_SCConv",
     "C3k2_SCSALite",
+    "C3k2_SHSA",
     "C3k2_StarBlockLite",
     "C3x",
     "CBFuse",
@@ -3091,6 +3092,64 @@ class C3k2_SCSALite(C3k2):
         """Apply C3k2, then directly refine features with SCSALite."""
         y = super().forward(x)
         return self.scsa(y)
+
+
+class SHSABlock(nn.Module):
+    """Single-head self-attention block with a lightweight convolutional bypass."""
+
+    def __init__(self, c1: int, ratio: float = 0.25):
+        """Initialize SHSABlock."""
+        super().__init__()
+        attn_c = max(16, int(c1 * ratio))
+        attn_c = min(attn_c, c1)
+        self.attn_c = attn_c
+        self.conv_c = c1 - attn_c
+        self.scale = attn_c**-0.5
+        self.norm = nn.BatchNorm2d(attn_c)
+        self.qkv = nn.Conv2d(attn_c, attn_c * 3, 1, bias=False)
+        self.local = nn.Sequential(
+            nn.Conv2d(attn_c, attn_c, 3, 1, 1, groups=attn_c, bias=False),
+            nn.BatchNorm2d(attn_c),
+            nn.SiLU(inplace=True),
+        )
+        self.proj = Conv(c1, c1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply single-head attention to a channel subset and keep a local bypass."""
+        xa, xb = torch.split(x, [self.attn_c, self.conv_c], dim=1) if self.conv_c else (x, None)
+        b, c, h, w = xa.shape
+        q, k, v = self.qkv(self.norm(xa)).flatten(2).chunk(3, dim=1)
+        attn = (q.transpose(1, 2) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        ya = (v @ attn.transpose(1, 2)).reshape(b, c, h, w)
+        ya = ya + self.local(xa)
+        y = torch.cat((ya, xb), dim=1) if xb is not None else ya
+        return self.proj(y)
+
+
+class C3k2_SHSA(C3k2):
+    """C3k2 followed by single-head self-attention refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        ratio: float = 0.25,
+    ):
+        """Initialize C3k2_SHSA with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.shsa = SHSABlock(c2, ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then directly refine features with SHSA."""
+        y = super().forward(x)
+        return self.shsa(y)
 
 
 class MogaBlockLite(nn.Module):
