@@ -28,10 +28,12 @@ __all__ = (
     "ESEDetect",
     "GhostHeadDetect",
     "LEDHDetect",
+    "OAHeadLiteDetect",
     "Pose",
     "RTDETRDecoder",
     "Segment",
     "SemanticSegment",
+    "TSCODELiteDetect",
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
@@ -358,6 +360,134 @@ class LEDHDetect(Detect):
             for i, (a, b) in enumerate(zip(self.one2one["box_head"], self.one2one["cls_head"])):
                 a[-1].bias.data[:] = 2.0
                 b[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
+
+
+class TSCODEClsContextLite(nn.Module):
+    """Lightweight classification context branch for TSCODE-lite Detect."""
+
+    def __init__(self, c1: int, c2: int, pool_k: int = 5):
+        """Initialize local and pooled semantic context paths."""
+        super().__init__()
+        self.local = Conv(c1, c2, 1, 1)
+        self.context = nn.Sequential(
+            nn.AvgPool2d(pool_k, stride=1, padding=pool_k // 2),
+            Conv(c1, c2, 1, 1),
+        )
+        self.mix = nn.Sequential(DWConv(c2, c2, 3), Conv(c2, c2, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fuse local features with pooled semantic context."""
+        return self.mix(self.local(x) + self.context(x))
+
+
+class TSCODERegContextLite(nn.Module):
+    """Lightweight regression context branch preserving local boundary detail."""
+
+    def __init__(self, c1: int, c2: int):
+        """Initialize high-resolution local regression context path."""
+        super().__init__()
+        self.reg = nn.Sequential(
+            DWConv(c1, c1, 3),
+            Conv(c1, c2, 1),
+            DWConv(c2, c2, 3),
+            Conv(c2, c2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract local boundary-aware regression features."""
+        return self.reg(x)
+
+
+class TSCODELiteDetect(Detect):
+    """Task-specific context decoupled Detect head for GCBlock-enhanced YOLOv11.
+
+    The classification branch uses lightweight pooled semantic context, while
+    the regression branch keeps high-resolution local context for boundaries.
+    """
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize TSCODELiteDetect."""
+        super().__init__(nc, reg_max, False, ch)
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(TSCODERegContextLite(x, c2), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(TSCODEClsContextLite(x, c3), nn.Conv2d(c3, self.nc, 1)) for x in ch
+        )
+
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class VisibleRegionGateLite(nn.Module):
+    """Lightweight visible-region gate for occlusion-aware detection features."""
+
+    def __init__(self, c1: int, reduction: int = 4):
+        """Initialize local visible-region modulation."""
+        super().__init__()
+        hidden = max(c1 // reduction, 16)
+        self.gate = nn.Sequential(
+            DWConv(c1, c1, 3),
+            Conv(c1, hidden, 1),
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Emphasize visible object regions without requiring occlusion labels."""
+        mask = self.gate(x)
+        return x * (1.0 + mask)
+
+
+class OAHeadLiteDetect(Detect):
+    """Occlusion-aware lightweight Detect head with visible-region gating."""
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize OAHeadLiteDetect."""
+        super().__init__(nc, reg_max, False, ch)
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))
+        self.gate = nn.ModuleList(VisibleRegionGateLite(x) for x in ch)
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(DWConv(x, x, 3), Conv(x, c2, 1), DWConv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1))
+            for x in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1), DWConv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1))
+            for x in ch
+        )
+
+        if end2end:
+            self.one2one_gate = copy.deepcopy(self.gate)
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    @property
+    def one2many(self):
+        """Return the visible-region gates and prediction branches."""
+        return dict(gate_head=self.gate, box_head=self.cv2, cls_head=self.cv3)
+
+    @property
+    def one2one(self):
+        """Return one-to-one visible-region gates and prediction branches."""
+        return dict(gate_head=self.one2one_gate, box_head=self.one2one_cv2, cls_head=self.one2one_cv3)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        gate_head: torch.nn.Module = None,
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """Apply visible-region gating before box and classification predictions."""
+        if gate_head is None or box_head is None or cls_head is None:
+            return dict()
+        bs = x[0].shape[0]
+        feats = [gate_head[i](x[i]) for i in range(self.nl)]
+        boxes = torch.cat([box_head[i](feats[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([cls_head[i](feats[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        return dict(boxes=boxes, scores=scores, feats=feats)
 
 
 class ESEAttn(nn.Module):
