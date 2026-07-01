@@ -66,6 +66,7 @@ __all__ = (
     "C3k2_RepHMSLite",
     "C3k2_RepMixerLite",
     "C3k2_SCConv",
+    "C3k2_SCSALite",
     "C3k2_StarBlockLite",
     "C3x",
     "CBFuse",
@@ -3021,6 +3022,75 @@ class C3k2_FocalModulationLite(C3k2):
         """Apply C3k2, then directly modulate features with focal context."""
         y = super().forward(x)
         return self.focal(y)
+
+
+class SCSALite(nn.Module):
+    """Lightweight spatial-channel synergistic attention for detection features."""
+
+    def __init__(self, c1: int, ratio: float = 0.25, kernels: tuple[int, ...] = (3, 7)):
+        """Initialize SCSALite.
+
+        This keeps SCSA's spatial-prior to channel-recalibration flow while
+        replacing heavier channel self-attention with lightweight channel gates.
+        """
+        super().__init__()
+        hidden = max(8, int(c1 * ratio))
+        self.h_convs = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c1, c1, (k, 1), 1, (k // 2, 0), groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+            )
+            for k in kernels
+        )
+        self.w_convs = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c1, c1, (1, k), 1, (0, k // 2), groups=c1, bias=False),
+                nn.BatchNorm2d(c1),
+            )
+            for k in kernels
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c1, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply spatial priors first, then channel recalibration."""
+        h_ctx = x.mean(dim=3, keepdim=True)
+        w_ctx = x.mean(dim=2, keepdim=True)
+        h_attn = sum(branch(h_ctx) for branch in self.h_convs)
+        w_attn = sum(branch(w_ctx) for branch in self.w_convs)
+        spatial = torch.sigmoid(h_attn.expand_as(x) + w_attn.expand_as(x))
+        x_spatial = x * spatial
+        return x_spatial * self.channel_gate(x_spatial)
+
+
+class C3k2_SCSALite(C3k2):
+    """C3k2 followed by lightweight spatial-channel synergistic attention."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        ratio: float = 0.25,
+    ):
+        """Initialize C3k2_SCSALite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.scsa = SCSALite(c2, ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then directly refine features with SCSALite."""
+        y = super().forward(x)
+        return self.scsa(y)
 
 
 class MogaBlockLite(nn.Module):
