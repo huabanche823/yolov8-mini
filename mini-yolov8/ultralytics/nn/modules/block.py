@@ -52,6 +52,8 @@ __all__ = (
     "C3k2_GCResidual",
     "C3k2_InceptionNeXtLite",
     "C3k2_MobileOneLite",
+    "C3k2_HorNetResidual",
+    "C3k2_MogaResidual",
     "C3k2_MSBlock",
     "C3k2_RFAConv",
     "C3k2_RepHELANLite",
@@ -86,6 +88,8 @@ __all__ = (
     "LSKBlock",
     "LineRefineLite",
     "MFAM",
+    "GnConvLite",
+    "MogaBlockLite",
     "MSBlock",
     "Proto",
     "RFAConv",
@@ -2643,6 +2647,114 @@ class C3k2_GCResidual(C3k2):
         """Apply C3k2, then blend in global context with a learnable residual scale."""
         y = super().forward(x)
         return y + self.alpha * (self.gc(y) - y)
+
+
+class MogaBlockLite(nn.Module):
+    """Lightweight multi-order gated aggregation block inspired by MogaNet."""
+
+    def __init__(self, c1: int, c2: int | None = None):
+        """Initialize MogaBlockLite.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.norm = nn.BatchNorm2d(c2)
+        splits = [c2 // 3, c2 // 3, c2 - 2 * (c2 // 3)]
+        self.splits = splits
+        self.dw3 = nn.Conv2d(splits[0], splits[0], 3, 1, 1, groups=splits[0], bias=False)
+        self.dw5 = nn.Conv2d(splits[1], splits[1], 5, 1, 2, groups=splits[1], bias=False)
+        self.dw7 = nn.Conv2d(splits[2], splits[2], 7, 1, 3, groups=splits[2], bias=False)
+        self.gate = nn.Sequential(nn.Conv2d(c2, c2, 1, bias=True), nn.Sigmoid())
+        self.value = nn.Conv2d(c2, c2, 1, bias=False)
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply multi-order depthwise aggregation with lightweight gating."""
+        x = self.proj(x)
+        x_norm = self.norm(x)
+        x1, x2, x3 = torch.split(x_norm, self.splits, dim=1)
+        agg = torch.cat((self.dw3(x1), self.dw5(x2), self.dw7(x3)), dim=1)
+        return x + self.fuse(self.value(x_norm) * self.gate(agg))
+
+
+class GnConvLite(nn.Module):
+    """Lightweight recursive gated convolution inspired by HorNet gnConv."""
+
+    def __init__(self, c1: int, c2: int | None = None):
+        """Initialize GnConvLite.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to ``c1``.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.pw1 = nn.Conv2d(c2, c2 * 2, 1, bias=False)
+        self.dw = nn.Conv2d(c2, c2, 7, 1, 3, groups=c2, bias=False)
+        self.pw2 = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply gated high-order spatial interaction in a lightweight form."""
+        x = self.proj(x)
+        gate, value = self.pw1(x).chunk(2, dim=1)
+        return x + self.pw2(value * torch.sigmoid(self.dw(gate)))
+
+
+class C3k2_MogaResidual(C3k2):
+    """C3k2 with learnable residual MogaBlock-lite fusion at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        alpha_init: float = 0.1,
+    ):
+        """Initialize C3k2_MogaResidual with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.moga = MogaBlockLite(c2, c2)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then blend in Moga context with a learnable residual scale."""
+        y = super().forward(x)
+        return y + self.alpha * (self.moga(y) - y)
+
+
+class C3k2_HorNetResidual(C3k2):
+    """C3k2 with learnable residual HorNet gnConv-lite fusion at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        alpha_init: float = 0.1,
+    ):
+        """Initialize C3k2_HorNetResidual with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.gnconv = GnConvLite(c2, c2)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then blend in gnConv context with a learnable residual scale."""
+        y = super().forward(x)
+        return y + self.alpha * (self.gnconv(y) - y)
 
 
 class GRNLayer(nn.Module):
