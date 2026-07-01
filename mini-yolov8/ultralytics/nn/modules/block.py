@@ -46,8 +46,11 @@ __all__ = (
     "C3Ghost",
     "C3k2",
     "C3k2PKI",
+    "C3k2_CrossConvLite",
     "C3k2_DDFM",
+    "C3k2_DCBLite",
     "C3k2_DSConv",
+    "C3k2_EAConvLite",
     "C3k2_EMA",
     "C3k2_GCResidual",
     "C3k2_InceptionNeXtLite",
@@ -1692,6 +1695,137 @@ class Bottleneck_MSBlock(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
+class DCBLite(nn.Module):
+    """Depthwise inverted residual detail block for lightweight local feature extraction."""
+
+    def __init__(self, c1: int, c2: int | None = None, expansion: float = 2.0, k: int = 3):
+        """Initialize DCBLite with MobileNet-style expansion and depthwise filtering."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        hidden = max(c1, int(c1 * expansion))
+        self.block = nn.Sequential(
+            Conv(c1, hidden, 1, 1),
+            nn.Conv2d(hidden, hidden, k, 1, autopad(k), groups=hidden, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+            Conv(hidden, c2, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply lightweight inverted residual detail extraction."""
+        return self.block(x)
+
+
+class EAConvLite(nn.Module):
+    """Efficient attention convolution with depthwise local mixing and channel-spatial gates."""
+
+    def __init__(self, c1: int, c2: int | None = None, reduction: int = 8):
+        """Initialize EAConvLite."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        hidden = max(8, c2 // reduction)
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.dw = nn.Sequential(
+            nn.Conv2d(c2, c2, 3, 1, 1, groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.SiLU(inplace=True),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c2, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c2, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(c2, 1, 3, 1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply efficient local attention while preserving a residual path."""
+        x = self.proj(x)
+        y = self.dw(x)
+        y = y * self.channel_gate(y) * self.spatial_gate(y)
+        return x + self.fuse(y)
+
+
+class CrossConvLite(nn.Module):
+    """Lightweight cross-shaped depthwise convolution for directional feature enhancement."""
+
+    def __init__(self, c1: int, c2: int | None = None, k: int = 5):
+        """Initialize CrossConvLite with horizontal and vertical depthwise branches."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.horizontal = nn.Sequential(
+            nn.Conv2d(c2, c2, (1, k), 1, (0, k // 2), groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        self.vertical = nn.Sequential(
+            nn.Conv2d(c2, c2, (k, 1), 1, (k // 2, 0), groups=c2, bias=False),
+            nn.BatchNorm2d(c2),
+        )
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Mix horizontal and vertical directional cues with a residual path."""
+        x = self.proj(x)
+        return x + self.fuse(self.horizontal(x) + self.vertical(x))
+
+
+class Bottleneck_DCBLite(nn.Module):
+    """CSP bottleneck using DCBLite for lightweight weak-texture detail extraction."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_DCBLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = DCBLite(c_, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DCBLite bottleneck with optional shortcut."""
+        y = self.cv2(self.cv1(x))
+        return x + y if self.add else y
+
+
+class Bottleneck_EAConvLite(nn.Module):
+    """CSP bottleneck using EAConvLite for confidence-friendly local attention."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_EAConvLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = EAConvLite(c_, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply EAConvLite bottleneck with optional shortcut."""
+        y = self.cv2(self.cv1(x))
+        return x + y if self.add else y
+
+
+class Bottleneck_CrossConvLite(nn.Module):
+    """CSP bottleneck using CrossConvLite for elongated directional structures."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_CrossConvLite."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = CrossConvLite(c_, c2)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply CrossConvLite bottleneck with optional shortcut."""
+        y = self.cv2(self.cv1(x))
+        return x + y if self.add else y
+
+
 class BottleneckCSP(nn.Module):
     """CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks."""
 
@@ -2618,6 +2752,78 @@ class C3k2_MSBlock(C3k2):
             C3k_MSBlock(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_MSBlock(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_DCBLite(C3k2):
+    """C3k2 variant using DCBLite bottlenecks for lightweight local detail enhancement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_DCBLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_DCBLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_EAConvLite(C3k2):
+    """C3k2 variant using efficient attention convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_EAConvLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_EAConvLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_CrossConvLite(C3k2):
+    """C3k2 variant using cross-shaped directional convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_CrossConvLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_CrossConvLite(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 
