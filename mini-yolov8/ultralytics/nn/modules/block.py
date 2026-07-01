@@ -52,6 +52,7 @@ __all__ = (
     "C3k2_DSConv",
     "C3k2_EAConvLite",
     "C3k2_EMA",
+    "C3k2_FocalModulationLite",
     "C3k2_GCResidual",
     "C3k2_CAAResidual",
     "C3k2_SEResidual",
@@ -2960,6 +2961,66 @@ class C3k2_CAAResidual(C3k2):
         y = super().forward(x)
         alpha = self.alpha_logit.sigmoid()
         return y + alpha * (self.caa(y) - y)
+
+
+class FocalModulationLite(nn.Module):
+    """Lightweight focal modulation with multi-level local and global context."""
+
+    def __init__(self, c1: int, ratio: float = 0.25, kernels: tuple[int, ...] = (3, 5)):
+        """Initialize FocalModulationLite."""
+        super().__init__()
+        hidden = max(8, int(c1 * ratio))
+        self.reduce = Conv(c1, hidden, 1, 1)
+        self.context_branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(hidden, hidden, k, 1, k // 2, groups=hidden, bias=False),
+                nn.BatchNorm2d(hidden),
+                nn.SiLU(inplace=True),
+            )
+            for k in kernels
+        )
+        self.gates = nn.Conv2d(c1, len(kernels) + 1, 1, bias=True)
+        self.modulator = nn.Sequential(
+            nn.Conv2d(hidden, c1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.out = Conv(c1, c1, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Modulate features with gated local and global context."""
+        ctx = self.reduce(x)
+        gates = torch.softmax(self.gates(x), dim=1)
+        ctx_all = torch.zeros_like(ctx)
+        for i, branch in enumerate(self.context_branches):
+            ctx_all = ctx_all + branch(ctx) * gates[:, i : i + 1]
+        global_ctx = ctx.mean((2, 3), keepdim=True).expand_as(ctx)
+        ctx_all = ctx_all + global_ctx * gates[:, len(self.context_branches) : len(self.context_branches) + 1]
+        return self.out(x * self.modulator(ctx_all))
+
+
+class C3k2_FocalModulationLite(C3k2):
+    """C3k2 followed by lightweight focal modulation at the output."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        ratio: float = 0.25,
+    ):
+        """Initialize C3k2_FocalModulationLite with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.focal = FocalModulationLite(c2, ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then directly modulate features with focal context."""
+        y = super().forward(x)
+        return self.focal(y)
 
 
 class MogaBlockLite(nn.Module):
