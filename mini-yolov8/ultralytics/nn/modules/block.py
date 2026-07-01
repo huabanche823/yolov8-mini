@@ -2641,12 +2641,14 @@ class C3k2_GCResidual(C3k2):
         """Initialize C3k2_GCResidual with the same core arguments as C3k2."""
         super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
         self.gc = GCBlock(c2, c2, ratio)
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        alpha_init = min(max(float(alpha_init), 1e-4), 1.0 - 1e-4)
+        self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(alpha_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply C3k2, then blend in global context with a learnable residual scale."""
         y = super().forward(x)
-        return y + self.alpha * (self.gc(y) - y)
+        alpha = self.alpha_logit.sigmoid()
+        return y + alpha * (self.gc(y) - y)
 
 
 class MogaBlockLite(nn.Module):
@@ -2723,12 +2725,14 @@ class C3k2_MogaResidual(C3k2):
         """Initialize C3k2_MogaResidual with C3k2-compatible arguments."""
         super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
         self.moga = MogaBlockLite(c2, c2)
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        alpha_init = min(max(float(alpha_init), 1e-4), 1.0 - 1e-4)
+        self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(alpha_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply C3k2, then blend in Moga context with a learnable residual scale."""
         y = super().forward(x)
-        return y + self.alpha * (self.moga(y) - y)
+        alpha = self.alpha_logit.sigmoid()
+        return y + alpha * (self.moga(y) - y)
 
 
 class C3k2_HorNetResidual(C3k2):
@@ -2749,12 +2753,14 @@ class C3k2_HorNetResidual(C3k2):
         """Initialize C3k2_HorNetResidual with C3k2-compatible arguments."""
         super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
         self.gnconv = GnConvLite(c2, c2)
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        alpha_init = min(max(float(alpha_init), 1e-4), 1.0 - 1e-4)
+        self.alpha_logit = nn.Parameter(torch.logit(torch.tensor(alpha_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply C3k2, then blend in gnConv context with a learnable residual scale."""
         y = super().forward(x)
-        return y + self.alpha * (self.gnconv(y) - y)
+        alpha = self.alpha_logit.sigmoid()
+        return y + alpha * (self.gnconv(y) - y)
 
 
 class GRNLayer(nn.Module):
