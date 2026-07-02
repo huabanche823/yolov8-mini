@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from . import LOGGER
 from .metrics import bbox_iou, probiou
@@ -353,6 +354,153 @@ class TaskAlignedAssigner(nn.Module):
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
+
+
+class SimOTAAssigner(TaskAlignedAssigner):
+    """A SimOTA-style dynamic-k assigner compatible with YOLO anchor points.
+
+    This assigner follows the YOLOX SimOTA matching idea: candidates are first
+    constrained to anchors whose centers fall inside a ground-truth box, then a
+    dynamic number of low-cost anchors is selected for each ground truth based on
+    the sum of its best IoUs.
+    """
+
+    def __init__(
+        self,
+        topk: int = 10,
+        num_classes: int = 80,
+        center_radius: float = 0.0,
+        cls_weight: float = 1.0,
+        iou_weight: float = 3.0,
+        eps: float = 1e-9,
+        **kwargs,
+    ):
+        """Initialize the SimOTA assigner."""
+        super().__init__(topk=topk, num_classes=num_classes, eps=eps, **kwargs)
+        self.center_radius = center_radius
+        self.cls_weight = cls_weight
+        self.iou_weight = iou_weight
+
+    @torch.no_grad()
+    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Compute dynamic-k SimOTA assignment."""
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        device = gt_bboxes.device
+
+        if self.n_max_boxes == 0:
+            return (
+                torch.full_like(pd_scores[..., 0], self.num_classes),
+                torch.zeros_like(pd_bboxes),
+                torch.zeros_like(pd_scores),
+                torch.zeros_like(pd_scores[..., 0]),
+                torch.zeros_like(pd_scores[..., 0]),
+            )
+
+        try:
+            return self._forward(pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                LOGGER.warning("CUDA OutOfMemoryError in SimOTAAssigner, using CPU")
+                cpu_tensors = [t.cpu() for t in (pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt)]
+                result = self._forward(*cpu_tensors)
+                return tuple(t.to(device) for t in result)
+            raise
+
+    def _forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+        """Compute SimOTA assignment one image at a time."""
+        bs, na, _ = pd_scores.shape
+        target_labels = torch.full((bs, na), self.num_classes, dtype=torch.long, device=pd_scores.device)
+        target_bboxes = torch.zeros((bs, na, gt_bboxes.shape[-1]), dtype=gt_bboxes.dtype, device=gt_bboxes.device)
+        target_scores = torch.zeros((bs, na, self.num_classes), dtype=pd_scores.dtype, device=pd_scores.device)
+        fg_mask = torch.zeros((bs, na), dtype=torch.bool, device=pd_scores.device)
+        target_gt_idx = torch.zeros((bs, na), dtype=torch.long, device=pd_scores.device)
+
+        for b in range(bs):
+            valid_gt_mask = mask_gt[b].squeeze(-1).bool()
+            num_gt = int(valid_gt_mask.sum().item())
+            if num_gt == 0:
+                continue
+
+            gt_bboxes_b = gt_bboxes[b, valid_gt_mask]
+            gt_labels_b = gt_labels[b, valid_gt_mask].long().squeeze(-1)
+            pairwise_ious = bbox_iou(
+                gt_bboxes_b[:, None, :], pd_bboxes[b][None, :, :], xywh=False, CIoU=False
+            ).squeeze(-1).clamp_(0)
+
+            candidate_mask = self.select_candidates_in_gts(anc_points, gt_bboxes_b[None], mask_gt[b : b + 1, valid_gt_mask])
+            candidate_mask = candidate_mask.squeeze(0).bool()
+            if self.center_radius > 0:
+                candidate_mask |= self.select_candidates_in_center(anc_points, gt_bboxes_b, self.center_radius)
+            if not candidate_mask.any():
+                candidate_mask = pairwise_ious > 0
+            if not candidate_mask.any():
+                continue
+
+            pairwise_cls_loss = self._classification_cost(pd_scores[b], gt_labels_b, candidate_mask)
+            pairwise_ious_loss = -torch.log(pairwise_ious.clamp(min=self.eps))
+            cost = pairwise_cls_loss * self.cls_weight + pairwise_ious_loss * self.iou_weight
+            cost = cost + (~candidate_mask).to(cost.dtype) * 100000.0
+
+            matching_matrix = self.dynamic_k_matching(cost, pairwise_ious, candidate_mask)
+            matched_gt_idx, matched_anchor_idx = matching_matrix.nonzero(as_tuple=True)
+            if matched_anchor_idx.numel() == 0:
+                continue
+
+            fg_mask[b, matched_anchor_idx] = True
+            target_gt_idx[b, matched_anchor_idx] = matched_gt_idx
+            target_labels[b, matched_anchor_idx] = gt_labels_b[matched_gt_idx]
+            target_bboxes[b, matched_anchor_idx] = gt_bboxes_b[matched_gt_idx]
+            target_scores[b, matched_anchor_idx, gt_labels_b[matched_gt_idx]] = pairwise_ious[
+                matched_gt_idx, matched_anchor_idx
+            ].to(target_scores.dtype)
+
+        return target_labels, target_bboxes, target_scores, fg_mask, target_gt_idx
+
+    def _classification_cost(self, pd_scores, gt_labels, candidate_mask):
+        """Compute BCE classification cost for every gt-anchor pair."""
+        num_gt, num_anchors = candidate_mask.shape
+        gt_onehot = F.one_hot(gt_labels, self.num_classes).to(pd_scores.dtype)
+        gt_onehot = gt_onehot[:, None, :].expand(num_gt, num_anchors, self.num_classes)
+        scores = pd_scores[None].expand(num_gt, num_anchors, self.num_classes).clamp(self.eps, 1.0 - self.eps)
+        cls_loss = F.binary_cross_entropy(scores.sqrt(), gt_onehot, reduction="none").sum(-1)
+        return cls_loss
+
+    def select_candidates_in_center(self, xy_centers, gt_bboxes, radius):
+        """Select anchors in a center region, useful when center_radius is enabled."""
+        gt_centers = (gt_bboxes[:, :2] + gt_bboxes[:, 2:]) * 0.5
+        gt_wh = (gt_bboxes[:, 2:] - gt_bboxes[:, :2]).clamp(min=self.eps)
+        center_half = gt_wh * radius * 0.5
+        center_boxes = torch.cat((gt_centers - center_half, gt_centers + center_half), dim=-1)
+        lt, rb = center_boxes[:, None, :2], center_boxes[:, None, 2:]
+        deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=-1)
+        return deltas.amin(-1).gt_(self.eps)
+
+    def dynamic_k_matching(self, cost, pairwise_ious, candidate_mask):
+        """Select a dynamic number of anchors for each ground truth."""
+        matching_matrix = torch.zeros_like(cost, dtype=torch.uint8)
+        num_gt = cost.shape[0]
+        n_candidate = min(self.topk, pairwise_ious.shape[1])
+        topk_ious = torch.topk(pairwise_ious * candidate_mask.to(pairwise_ious.dtype), n_candidate, dim=1).values
+        dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1)
+
+        for gt_idx in range(num_gt):
+            valid = candidate_mask[gt_idx]
+            if not valid.any():
+                continue
+            dynamic_k = min(int(dynamic_ks[gt_idx].item()), int(valid.sum().item()))
+            _, pos_idx = torch.topk(cost[gt_idx][valid], k=dynamic_k, largest=False)
+            anchor_idx = valid.nonzero(as_tuple=False).squeeze(1)[pos_idx]
+            matching_matrix[gt_idx, anchor_idx] = 1
+
+        anchor_matching_gt = matching_matrix.sum(0)
+        if anchor_matching_gt.max() > 1:
+            multi_match = anchor_matching_gt > 1
+            _, cost_argmin = torch.min(cost[:, multi_match], dim=0)
+            matching_matrix[:, multi_match] = 0
+            matching_matrix[cost_argmin, multi_match] = 1
+
+        return matching_matrix.bool()
 
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):

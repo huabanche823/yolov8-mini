@@ -12,7 +12,14 @@ import torch.nn.functional as F
 
 from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import (
+    RotatedTaskAlignedAssigner,
+    SimOTAAssigner,
+    TaskAlignedAssigner,
+    dist2bbox,
+    dist2rbox,
+    make_anchors,
+)
 from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
@@ -525,15 +532,25 @@ class v8DetectionLoss:
         if self.class_weights is not None:
             self.class_weights = self.class_weights.to(device).view(1, 1, -1)
         self.cls_pos_only = bool(getattr(h, "cls_pos_only", False))
+        self.assigner_type = str(getattr(h, "assigner", "taskaligned") or "taskaligned").replace("-", "_").lower()
+        self.cls_loss_type = str(getattr(h, "cls_loss", "bce") or "bce").replace("-", "_").lower()
+        self.focal_gamma = float(getattr(h, "focal_gamma", 1.5))
+        self.focal_alpha = float(getattr(h, "focal_alpha", 0.25))
 
-        self.assigner = TaskAlignedAssigner(
-            topk=tal_topk,
-            num_classes=self.nc,
-            alpha=0.5,
-            beta=6.0,
-            stride=self.stride.tolist(),
-            topk2=tal_topk2,
-        )
+        assigner_kwargs = dict(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0, stride=self.stride.tolist())
+        if self.assigner_type in {"taskaligned", "tal", "task_aligned"}:
+            self.assigner = TaskAlignedAssigner(**assigner_kwargs, topk2=tal_topk2)
+        elif self.assigner_type == "simota":
+            self.assigner = SimOTAAssigner(
+                **assigner_kwargs,
+                center_radius=float(getattr(h, "simota_center_radius", 0.0)),
+                cls_weight=float(getattr(h, "simota_cls_weight", 1.0)),
+                iou_weight=float(getattr(h, "simota_iou_weight", 3.0)),
+            )
+        else:
+            raise ValueError("Unsupported assigner={!r}. Use 'taskaligned' or 'simota'.".format(self.assigner_type))
+        if self.cls_loss_type not in {"bce", "focal"}:
+            raise ValueError("Unsupported cls_loss={!r}. Use 'bce' or 'focal'.".format(self.cls_loss_type))
         self.bbox_loss = BboxLoss(
             m.reg_max, bbox_loss=getattr(h, "bbox_loss", "ciou"), shape_iou_scale=getattr(h, "shape_iou_scale", 0.0)
         ).to(device)
@@ -565,6 +582,25 @@ class v8DetectionLoss:
             # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+    def classification_loss(self, pred_scores: torch.Tensor, target_scores: torch.Tensor) -> torch.Tensor:
+        """Compute BCE or Focal classification loss with optional class weights."""
+        dtype = pred_scores.dtype
+        target_scores = target_scores.to(dtype)
+        cls_loss = self.bce(pred_scores, target_scores)
+        if self.cls_loss_type == "focal":
+            pred_prob = pred_scores.sigmoid()
+            p_t = target_scores * pred_prob + (1.0 - target_scores) * (1.0 - pred_prob)
+            cls_loss *= (1.0 - p_t).pow(self.focal_gamma)
+            if self.focal_alpha > 0:
+                alpha = torch.tensor(self.focal_alpha, dtype=dtype, device=pred_scores.device)
+                cls_loss *= target_scores * alpha + (1.0 - target_scores) * (1.0 - alpha)
+        if self.class_weights is not None:
+            if self.cls_pos_only:
+                cls_loss *= 1.0 + target_scores.gt(0).to(dtype) * (self.class_weights - 1.0)
+            else:
+                cls_loss *= self.class_weights
+        return cls_loss
 
     def get_assigned_targets_and_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> tuple:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size and return foreground mask and
@@ -602,13 +638,7 @@ class v8DetectionLoss:
         target_scores_sum = max(target_scores.sum(), 1)
 
         # Cls loss with optional class weighting
-        bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
-        if self.class_weights is not None:
-            if self.cls_pos_only:
-                bce_loss *= 1.0 + target_scores.gt(0).to(dtype) * (self.class_weights - 1.0)
-            else:
-                bce_loss *= self.class_weights
-        loss[1] = bce_loss.sum() / target_scores_sum  # BCE
+        loss[1] = self.classification_loss(pred_scores, target_scores).sum() / target_scores_sum
 
         # Bbox loss
         if fg_mask.sum():

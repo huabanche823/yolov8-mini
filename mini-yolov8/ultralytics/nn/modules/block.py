@@ -51,6 +51,7 @@ __all__ = (
     "C3k2_DCBLite",
     "C3k2_DSConv",
     "C3k2_EAConvLite",
+    "C3k2_FADC",
     "C3k2_EMA",
     "C3k2_FocalModulationLite",
     "C3k2_GCResidual",
@@ -88,6 +89,7 @@ __all__ = (
     "DWRLite",
     "DySample",
     "FusionFactor",
+    "FADCLite",
     "GAM",
     "GCBlock",
     "GCConv",
@@ -676,6 +678,61 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class FADCLite(nn.Module):
+    """Frequency-adaptive dilated convolution for lightweight spatial feature enhancement."""
+
+    def __init__(self, c: int, reduction: int = 4):
+        """Initialize FADCLite.
+
+        Args:
+            c (int): Input and output channels.
+            reduction (int): Channel reduction ratio for the frequency gate.
+        """
+        super().__init__()
+        hidden = max(c // reduction, 8)
+        self.pre = Conv(c, c, 1, 1)
+        self.dw1 = nn.Conv2d(c, c, 3, 1, 1, dilation=1, groups=c, bias=False)
+        self.dw2 = nn.Conv2d(c, c, 3, 1, 2, dilation=2, groups=c, bias=False)
+        self.dw3 = nn.Conv2d(c, c, 3, 1, 3, dilation=3, groups=c, bias=False)
+        self.bn = nn.BatchNorm2d(c)
+        self.gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, hidden, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, c * 3, 1, bias=True),
+        )
+        self.fuse = Conv(c, c, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply frequency-guided adaptive fusion of multi-dilation depthwise convolutions."""
+        y = self.pre(x)
+        low = F.avg_pool2d(y, kernel_size=3, stride=1, padding=1)
+        freq = (y - low).abs()
+        b, c, h, w = y.shape
+        weights = self.gate(freq).view(b, 3, c, 1, 1).softmax(dim=1)
+        branches = torch.stack((self.dw1(y), self.dw2(y), self.dw3(y)), dim=1)
+        y = (branches * weights).sum(dim=1)
+        return self.fuse(self.bn(y))
+
+
+class Bottleneck_FADC(nn.Module):
+    """Bottleneck using FADCLite as the spatial mixing operator."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_FADC with Bottleneck-compatible arguments."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.fadc = FADCLite(c_)
+        self.cv2 = Conv(c_, c2, 1, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply FADC bottleneck with optional shortcut connection."""
+        y = self.cv2(self.fadc(self.cv1(x)))
+        return x + y if self.add else y
 
 
 class PartialConv(nn.Module):
@@ -2852,6 +2909,30 @@ class C3k2_EAConvLite(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_EAConvLite(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_FADC(C3k2):
+    """C3k2 variant using frequency-adaptive dilated convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_FADC with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_FADC(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 

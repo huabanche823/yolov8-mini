@@ -144,6 +144,10 @@ CFG_FLOAT_KEYS = frozenset(
         "cls",
         "cls_pw",
         "dfl",
+        "focal_gamma",
+        "simota_center_radius",
+        "simota_cls_weight",
+        "simota_iou_weight",
         "shape_iou_scale",
         "degrees",
         "shear",
@@ -155,6 +159,7 @@ CFG_FLOAT_KEYS = frozenset(
 CFG_FRACTION_KEYS = frozenset(
     {  # fractional float arguments with 0.0<=values<=1.0
         "dropout",
+        "focal_alpha",
         "lr0",
         "lrf",
         "momentum",
