@@ -57,6 +57,7 @@ __all__ = (
     "C3k2_CAAResidual",
     "C3k2_SEResidual",
     "C3k2_InceptionNeXtLite",
+    "C3k2_MCA",
     "C3k2_MobileOneLite",
     "C3k2_HorNetResidual",
     "C3k2_MogaResidual",
@@ -69,6 +70,7 @@ __all__ = (
     "C3k2_SCSALite",
     "C3k2_SHSA",
     "C3k2_StarBlockLite",
+    "CSPStageLite",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -378,6 +380,27 @@ class C2f(nn.Module):
         y = [y[0], y[1]]
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class CSPStageLite(nn.Module):
+    """Lightweight CSP stage for neck fusion with limited feature distribution shift."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = False, g: int = 1, e: float = 0.5):
+        """Initialize CSPStageLite.
+
+        This stage keeps one branch as a shallow identity-like path and refines the other branch with
+        lightweight bottlenecks, then fuses both branches with a 1x1 projection.
+        """
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.blocks = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n)))
+        self.cv3 = Conv(2 * c_, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fuse preserved and refined CSP branches."""
+        return self.cv3(torch.cat((self.cv1(x), self.blocks(self.cv2(x))), 1))
 
 
 
@@ -1609,6 +1632,30 @@ class GCBlock(nn.Module):
         """Recalibrate features with global context while preserving residual content."""
         x = self.proj(x)
         return x + self.channel_add(self.spatial_pool(x))
+
+
+class MCAContext(nn.Module):
+    """Moment channel attention using global feature statistics for recalibration."""
+
+    def __init__(self, c1: int, reduction: int = 16):
+        """Initialize MCAContext."""
+        super().__init__()
+        hidden = max(8, c1 // reduction)
+        self.excite = nn.Sequential(
+            nn.Conv2d(c1 * 3, hidden, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c1, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Recalibrate channels using mean, variance, and third central moment."""
+        mean = x.mean((2, 3), keepdim=True)
+        centered = x - mean
+        var = centered.pow(2).mean((2, 3), keepdim=True)
+        skew = centered.pow(3).mean((2, 3), keepdim=True)
+        moments = torch.cat((mean, var, skew), dim=1)
+        return x * self.excite(moments)
 
 
 class GCConv(nn.Module):
@@ -2860,6 +2907,31 @@ class C3k2_GCResidual(C3k2):
         y = super().forward(x)
         alpha = self.alpha_logit.sigmoid()
         return y + alpha * (self.gc(y) - y)
+
+
+class C3k2_MCA(C3k2):
+    """C3k2 followed by moment channel attention recalibration."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+        reduction: int = 16,
+    ):
+        """Initialize C3k2_MCA with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.mca = MCAContext(c2, reduction)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply C3k2, then directly recalibrate features with MCA."""
+        y = super().forward(x)
+        return self.mca(y)
 
 
 class SEContextLite(nn.Module):
