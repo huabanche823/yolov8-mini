@@ -52,6 +52,7 @@ __all__ = (
     "C3k2_DSConv",
     "C3k2_EAConvLite",
     "C3k2_FADC",
+    "C3k2_FDConv",
     "C3k2_EMA",
     "C3k2_FocalModulationLite",
     "C3k2_GCResidual",
@@ -68,10 +69,12 @@ __all__ = (
     "C3k2_RepHMSLite",
     "C3k2_RepMixerLite",
     "C3k2_SCConv",
+    "C3k2_SFSConv",
     "C3k2_SCSALite",
     "C3k2_SHSA",
     "C3k2_StarBlockLite",
     "CSPStageLite",
+    "FeaturePyramidSharedConvLite",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -90,6 +93,7 @@ __all__ = (
     "DySample",
     "FusionFactor",
     "FADCLite",
+    "FDConv",
     "GAM",
     "GCBlock",
     "GCConv",
@@ -111,10 +115,12 @@ __all__ = (
     "ResCBAM",
     "ResNetLayer",
     "LDownLite",
+    "RFPNLiteFuse",
     "SCDown",
     "SEAM",
     "SNIFuse2",
     "StripEnhance",
+    "SFSConv",
     "FreqFusionLite",
     "TorchVision",
     "WTConvDown",
@@ -404,6 +410,26 @@ class CSPStageLite(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Fuse preserved and refined CSP branches."""
         return self.cv3(torch.cat((self.cv1(x), self.blocks(self.cv2(x))), 1))
+
+
+class FeaturePyramidSharedConvLite(nn.Module):
+    """Lightweight shared-convolution block for a single FPN/PAN fusion level."""
+
+    def __init__(self, c1: int, c2: int, n: int = 2, e: float = 1.0):
+        """Initialize a shared depthwise-pointwise refinement block."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.reduce = Conv(c1, c_, 1, 1) if c1 != c_ else nn.Identity()
+        self.shared = nn.Sequential(DWConv(c_, c_, 3, 1), Conv(c_, c_, 1, 1))
+        self.expand = Conv(c_, c2, 1, 1) if c_ != c2 else nn.Identity()
+        self.n = max(int(n), 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply repeated refinement with shared parameters."""
+        y = self.reduce(x)
+        for _ in range(self.n):
+            y = y + self.shared(y)
+        return self.expand(y)
 
 
 
@@ -733,6 +759,148 @@ class Bottleneck_FADC(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply FADC bottleneck with optional shortcut connection."""
         y = self.cv2(self.fadc(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class FDConv(nn.Module):
+    """Frequency dynamic convolution with adaptive multi-dilation spatial mixing."""
+
+    def __init__(self, c: int, reduction: int = 4):
+        """Initialize FDConv.
+
+        Args:
+            c (int): Input and output channels.
+            reduction (int): Channel reduction ratio for dynamic branch weighting.
+        """
+        super().__init__()
+        hidden = max(c // reduction, 16)
+        self.pre = Conv(c, c, 1, 1)
+        self.dw1 = nn.Conv2d(c, c, 3, 1, 1, dilation=1, groups=c, bias=False)
+        self.dw3 = nn.Conv2d(c, c, 3, 1, 3, dilation=3, groups=c, bias=False)
+        self.dw5 = nn.Conv2d(c, c, 3, 1, 5, dilation=5, groups=c, bias=False)
+        self.high_refine = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+        )
+        self.branch_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c * 2, hidden, 1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c * 4, 1, bias=True),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, hidden, 1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.fuse = Conv(c, c, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply frequency-guided dynamic fusion of local, large-context, and high-frequency branches."""
+        y = self.pre(x)
+        low = F.avg_pool2d(y, kernel_size=5, stride=1, padding=2)
+        high = y - low
+        desc = torch.cat((y, high.abs()), 1)
+        b, c, _, _ = y.shape
+        weights = self.branch_gate(desc).view(b, 4, c, 1, 1).softmax(dim=1)
+        branches = torch.stack((self.dw1(y), self.dw3(y), self.dw5(y), self.high_refine(high)), dim=1)
+        y = (branches * weights).sum(dim=1)
+        y = y * self.channel_gate(y)
+        return self.fuse(y)
+
+
+class Bottleneck_FDConv(nn.Module):
+    """Bottleneck using FDConv as the spatial-frequency dynamic operator."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_FDConv with Bottleneck-compatible arguments."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.fdconv = FDConv(c_)
+        self.cv2 = Conv(c_, c2, 1, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply FDConv bottleneck with optional shortcut connection."""
+        y = self.cv2(self.fdconv(self.cv1(x)))
+        return x + y if self.add else y
+
+
+class SFSConv(nn.Module):
+    """Spatial-frequency selection convolution for degraded and low-contrast features."""
+
+    def __init__(self, c: int, reduction: int = 4):
+        """Initialize SFSConv.
+
+        Args:
+            c (int): Input and output channels.
+            reduction (int): Channel reduction ratio for spatial-frequency selection.
+        """
+        super().__init__()
+        hidden = max(c // reduction, 16)
+        self.pre = Conv(c, c, 1, 1)
+        self.local = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+        )
+        self.large = nn.Sequential(
+            nn.Conv2d(c, c, (1, 7), 1, (0, 3), groups=c, bias=False),
+            nn.Conv2d(c, c, (7, 1), 1, (3, 0), groups=c, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+        )
+        self.freq = nn.Sequential(
+            nn.Conv2d(c, c, 3, 1, 1, groups=c, bias=False),
+            nn.BatchNorm2d(c),
+            nn.SiLU(inplace=True),
+        )
+        self.selector = nn.Sequential(
+            Conv(c * 3, hidden, 1, 1),
+            nn.Conv2d(hidden, 3, 1, bias=True),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, hidden, 1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden, c, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.fuse = Conv(c, c, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Selectively fuse local spatial, large-strip spatial, and high-frequency responses."""
+        y = self.pre(x)
+        low = F.avg_pool2d(y, kernel_size=3, stride=1, padding=1)
+        high = y - low
+        local = self.local(y)
+        large = self.large(y)
+        freq = self.freq(high)
+        weights = torch.softmax(self.selector(torch.cat((local, large, freq), 1)), dim=1)
+        y = local * weights[:, 0:1] + large * weights[:, 1:2] + freq * weights[:, 2:3]
+        y = y * self.channel_gate(y)
+        return self.fuse(y)
+
+
+class Bottleneck_SFSConv(nn.Module):
+    """Bottleneck using SFSConv as the spatial-frequency selection operator."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_SFSConv with Bottleneck-compatible arguments."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.sfsconv = SFSConv(c_)
+        self.cv2 = Conv(c_, c2, 1, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply SFSConv bottleneck with optional shortcut connection."""
+        y = self.cv2(self.sfsconv(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -2938,6 +3106,54 @@ class C3k2_FADC(C3k2):
         )
 
 
+class C3k2_FDConv(C3k2):
+    """C3k2 variant using frequency dynamic convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_FDConv with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_FDConv(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_SFSConv(C3k2):
+    """C3k2 variant using spatial-frequency selection convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_SFSConv with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_SFSConv(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
 class C3k2_CrossConvLite(C3k2):
     """C3k2 variant using cross-shaped directional convolution bottlenecks."""
 
@@ -3894,6 +4110,32 @@ class FreqFusionLite(nn.Module):
         low = low0 * low_weights[:, 0:1] + low1 * low_weights[:, 1:2]
         high = high0 * high_weights[:, 0:1] + high1 * high_weights[:, 1:2]
         return self.refine(low + self.high_scale.sigmoid() * high)
+
+
+class RFPNLiteFuse(nn.Module):
+    """Weak residual top-down fusion inspired by rethinking feature-pyramid fusion."""
+
+    def __init__(self, channels: list[int] | tuple[int, int], c2: int, init_weight: float = 0.25):
+        """Initialize RFPNLiteFuse."""
+        super().__init__()
+        assert len(channels) == 2, "RFPNLiteFuse expects exactly two input feature maps"
+        c_high, c_low = channels
+        init_weight = min(max(float(init_weight), 1e-3), 1.0 - 1e-3)
+        self.high_align = Conv(c_high, c2, 1, 1) if c_high != c2 else nn.Identity()
+        self.low_align = Conv(c_low, c2, 1, 1) if c_low != c2 else nn.Identity()
+        self.high_gate = nn.Parameter(torch.logit(torch.tensor(init_weight)))
+        self.refine = nn.Sequential(DWConv(c2, c2, 3, 1), Conv(c2, c2, 1, 1))
+
+    @staticmethod
+    def _resize(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Resize feature map to target size when adjacent scales differ."""
+        return x if x.shape[-2:] == size else F.interpolate(x, size=size, mode="nearest")
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Fuse high-level context as a weak residual into the low-level feature."""
+        high, low = x
+        high = self._resize(high, low.shape[-2:])
+        return self.refine(self.low_align(low) + torch.sigmoid(self.high_gate) * self.high_align(high))
 
 
 class CoordAtt(nn.Module):
