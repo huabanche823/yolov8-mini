@@ -110,6 +110,7 @@ __all__ = (
     "RepVGGDW",
     "ResCBAM",
     "ResNetLayer",
+    "LDownLite",
     "SCDown",
     "SEAM",
     "SNIFuse2",
@@ -4781,6 +4782,23 @@ class SCDown(nn.Module):
             (torch.Tensor): Downsampled output tensor.
         """
         return self.cv2(self.cv1(x))
+
+
+class LDownLite(nn.Module):
+    """Lightweight two-branch downsampling for neck bottom-up paths."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, s: int = 2):
+        """Initialize LDownLite with local-detail and low-frequency context branches."""
+        super().__init__()
+        c_local = max(c2 // 2, 1)
+        c_context = c2 - c_local
+        self.local = nn.Sequential(DWConv(c1, c_local, k, s), Conv(c_local, c_local, 1, 1))
+        self.context = nn.Sequential(nn.AvgPool2d(kernel_size=s, stride=s), Conv(c1, c_context, 1, 1))
+        self.fuse = Conv(c2, c2, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Downsample while preserving local detail and low-frequency context."""
+        return self.fuse(torch.cat((self.local(x), self.context(x)), 1))
 
 
 class TorchVision(nn.Module):
