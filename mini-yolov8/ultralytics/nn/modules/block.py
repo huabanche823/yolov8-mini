@@ -54,6 +54,7 @@ __all__ = (
     "C3k2_FADC",
     "C3k2_FDConv",
     "C3k2_EMA",
+    "C3k2_ODConv",
     "C3k2_FocalModulationLite",
     "C3k2_GCResidual",
     "C3k2_CAAResidual",
@@ -91,6 +92,8 @@ __all__ = (
     "DSConv",
     "DWRLite",
     "DySample",
+    "ELA",
+    "EUCB",
     "FusionFactor",
     "FADCLite",
     "FDConv",
@@ -107,6 +110,7 @@ __all__ = (
     "GnConvLite",
     "MogaBlockLite",
     "MSBlock",
+    "ODConv",
     "Proto",
     "RFAConv",
     "RepC3",
@@ -901,6 +905,144 @@ class Bottleneck_SFSConv(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply SFSConv bottleneck with optional shortcut connection."""
         y = self.cv2(self.sfsconv(self.cv1(x)))
+        return x + y if self.add else y
+
+
+def _valid_group_count(channels: int, max_groups: int = 16) -> int:
+    """Return the largest group count up to max_groups that divides channels."""
+    groups = min(max_groups, channels)
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+class ELA(nn.Module):
+    """Efficient local attention with separate height and width context encoding."""
+
+    def __init__(self, c1: int, c2: int | None = None, k: int = 7):
+        """Initialize ELA.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int | None): Output channels. Defaults to c1.
+            k (int): 1D local context kernel size.
+        """
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        groups = _valid_group_count(c2)
+        pad = k // 2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.conv_h = nn.Conv1d(c2, c2, k, padding=pad, groups=c2, bias=False)
+        self.conv_w = nn.Conv1d(c2, c2, k, padding=pad, groups=c2, bias=False)
+        self.gn_h = nn.GroupNorm(groups, c2)
+        self.gn_w = nn.GroupNorm(groups, c2)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply directional local attention to suppress background responses."""
+        x = self.proj(x)
+        attn_h = self.act(self.gn_h(self.conv_h(x.mean(dim=3)))).unsqueeze(3)
+        attn_w = self.act(self.gn_w(self.conv_w(x.mean(dim=2)))).unsqueeze(2)
+        return x * attn_h * attn_w
+
+
+class EUCB(nn.Module):
+    """Efficient up-convolution block for enhanced neck upsampling."""
+
+    def __init__(self, c1: int, c2: int, k: int = 3, scale: int = 2):
+        """Initialize EUCB.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            k (int): Depthwise convolution kernel size.
+            scale (int): Upsampling scale factor.
+        """
+        super().__init__()
+        self.scale = scale
+        self.dw = nn.Sequential(
+            nn.Conv2d(c1, c1, k, 1, autopad(k), groups=c1, bias=False),
+            nn.BatchNorm2d(c1),
+            nn.SiLU(inplace=True),
+        )
+        self.pw = Conv(c1, c2, 1, 1)
+        self.attn = ELA(c2, c2, k=7)
+
+    @staticmethod
+    def _channel_shuffle(x: torch.Tensor, groups: int = 4) -> torch.Tensor:
+        """Shuffle channels when possible to mix depthwise groups."""
+        b, c, h, w = x.shape
+        if c % groups != 0:
+            return x
+        x = x.view(b, groups, c // groups, h, w).transpose(1, 2).contiguous()
+        return x.view(b, c, h, w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample and refine features for top-down neck fusion."""
+        x = F.interpolate(x, scale_factor=self.scale, mode="nearest")
+        x = self._channel_shuffle(self.dw(x))
+        return self.attn(self.pw(x))
+
+
+class ODConv(nn.Module):
+    """Omni-dimensional dynamic convolution style block with kernel, channel, and filter gates."""
+
+    def __init__(self, c: int, kernel_num: int = 4, reduction: int = 4):
+        """Initialize ODConv.
+
+        Args:
+            c (int): Input and output channels.
+            kernel_num (int): Number of parallel depthwise kernel branches.
+            reduction (int): Channel reduction ratio for attention generation.
+        """
+        super().__init__()
+        hidden = max(c // reduction, 16)
+        self.pre = Conv(c, c, 1, 1)
+        self.branches = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(c, c, 3, 1, 1 + i, dilation=1 + i, groups=c, bias=False),
+                nn.BatchNorm2d(c),
+                nn.SiLU(inplace=True),
+            )
+            for i in range(kernel_num)
+        )
+        self.context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(c, hidden, 1, bias=False),
+            nn.SiLU(inplace=True),
+        )
+        self.channel_gate = nn.Sequential(nn.Conv2d(hidden, c, 1, bias=True), nn.Sigmoid())
+        self.filter_gate = nn.Sequential(nn.Conv2d(hidden, c, 1, bias=True), nn.Sigmoid())
+        self.kernel_gate = nn.Conv2d(hidden, kernel_num, 1, bias=True)
+        self.fuse = Conv(c, c, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply dynamic channel, filter, and kernel-branch modulation."""
+        y = self.pre(x)
+        context = self.context(y)
+        y = y * self.channel_gate(context)
+        kernel_weight = torch.softmax(self.kernel_gate(context), dim=1)
+        branches = torch.stack([branch(y) for branch in self.branches], dim=1)
+        y = (branches * kernel_weight.unsqueeze(2)).sum(dim=1)
+        y = y * self.filter_gate(context)
+        return self.fuse(y)
+
+
+class Bottleneck_ODConv(nn.Module):
+    """Bottleneck using ODConv as the dynamic spatial operator."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize Bottleneck_ODConv with Bottleneck-compatible arguments."""
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.odconv = ODConv(c_)
+        self.cv2 = Conv(c_, c2, 1, 1, g=g)
+        self.add = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply ODConv bottleneck with optional shortcut connection."""
+        y = self.cv2(self.odconv(self.cv1(x)))
         return x + y if self.add else y
 
 
@@ -3126,6 +3268,30 @@ class C3k2_FDConv(C3k2):
             C3k(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_FDConv(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_ODConv(C3k2):
+    """C3k2 variant using omni-dimensional dynamic convolution bottlenecks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize C3k2_ODConv with C3k2-compatible arguments."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else Bottleneck_ODConv(self.c, self.c, shortcut, g, e=1.0)
             for _ in range(n)
         )
 

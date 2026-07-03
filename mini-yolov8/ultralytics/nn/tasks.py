@@ -55,6 +55,7 @@ from ultralytics.nn.modules import (
     C3k2_FADC,
     C3k2_FDConv,
     C3k2_EMA,
+    C3k2_ODConv,
     C3k2_FocalModulationLite,
     C3k2_GCResidual,
     C3k2_HorNetResidual,
@@ -93,6 +94,8 @@ from ultralytics.nn.modules import (
     TripletAttention,
     DWRLite,
     DySample,
+    ELA,
+    EUCB,
     DyHeadLiteDetect,
     DWConv,
     DWConvTranspose2d,
@@ -120,6 +123,7 @@ from ultralytics.nn.modules import (
     LineRefineLite,
     MFAM,
     MSBlock,
+    ODConv,
     Pose,
     Pose26,
     RepC3,
@@ -1777,6 +1781,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_FADC,
             C3k2_FDConv,
             C3k2_EMA,
+            C3k2_ODConv,
             C3k2_FocalModulationLite,
             C3k2_GCResidual,
             C3k2_HorNetResidual,
@@ -1810,10 +1815,13 @@ def parse_model(d, ch, verbose=True):
             C3Ghost,
             torch.nn.ConvTranspose2d,
             DWConvTranspose2d,
+            ELA,
+            EUCB,
             C3x,
             RepC3,
             PSA,
             LDownLite,
+            ODConv,
             SCDown,
             SEAM,
             GAM,
@@ -1845,6 +1853,7 @@ def parse_model(d, ch, verbose=True):
             C3k2_FADC,
             C3k2_FDConv,
             C3k2_EMA,
+            C3k2_ODConv,
             C3k2_FocalModulationLite,
             C3k2_GCResidual,
             C3k2_HorNetResidual,
@@ -1906,7 +1915,7 @@ def parse_model(d, ch, verbose=True):
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
                 n = 1
-            if m in frozenset({C3k2, C3k2_CAAResidual, C3k2_CrossConvLite, C3k2_DCBLite, C3k2_DDFM, C3k2_DSConv, C3k2_EAConvLite, C3k2_FADC, C3k2_FDConv, C3k2_EMA, C3k2_FocalModulationLite, C3k2_GCResidual, C3k2_HorNetResidual, C3k2_InceptionNeXtLite, C3k2_MCA, C3k2_MobileOneLite, C3k2_MogaResidual, C3k2_MSBlock, C3k2_RFAConv, C3k2_RepMixerLite, C3k2_SCConv, C3k2_SEResidual, C3k2_SFSConv, C3k2_SCSALite, C3k2_SHSA, C3k2_StarBlockLite, PConvFasterC3k2}):  # for M/L/X sizes
+            if m in frozenset({C3k2, C3k2_CAAResidual, C3k2_CrossConvLite, C3k2_DCBLite, C3k2_DDFM, C3k2_DSConv, C3k2_EAConvLite, C3k2_FADC, C3k2_FDConv, C3k2_EMA, C3k2_ODConv, C3k2_FocalModulationLite, C3k2_GCResidual, C3k2_HorNetResidual, C3k2_InceptionNeXtLite, C3k2_MCA, C3k2_MobileOneLite, C3k2_MogaResidual, C3k2_MSBlock, C3k2_RFAConv, C3k2_RepMixerLite, C3k2_SCConv, C3k2_SEResidual, C3k2_SFSConv, C3k2_SCSALite, C3k2_SHSA, C3k2_StarBlockLite, PConvFasterC3k2}):  # for M/L/X sizes
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
