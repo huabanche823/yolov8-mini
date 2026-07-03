@@ -22,9 +22,9 @@ backbone:
   - [-1, 1, GCBlock, [512]] # 9-GC-P4
   - [-1, 1, Conv, [1024, 3, 2]] # 10-P5/32
   - [-1, 2, C3k2, [1024, True]] # 11
-  - [-1, 1, SPPF, [1024, 5]] # 12
-  - [-1, 2, C2PSA, [1024]] # 13-P5/32
-  - [-1, 1, GCBlock, [1024]] # 14-GC-P5
+  - [-1, 1, GCBlock, [1024]] # 12-GC-P5
+  - [-1, 1, SPPF, [1024, 5]] # 13
+  - [-1, 2, C2PSA, [1024]] # 14-P5/32
 
 head:
   # P5 -> P4: weak residual fusion, avoids strong concat injection from P5
