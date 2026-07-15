@@ -1,9 +1,4 @@
-# Ultralytics YOLO11 object detection model with GCBlock backbone + FreqFusion neck.
-#
-# Degradation-robust ablation:
-# - Keeps GCBlock after the P3/P4 backbone C3k2 blocks.
-# - Replaces neck Concat fusion nodes with FreqFusionLite to fuse low-frequency
-#   context and high-frequency boundary details under blur/compression/noise.
+# YOLOv11n + GCBlock(P2/P3/P4) + FreqFusion-lite P4-only Neck
 
 nc: 5
 scales:
@@ -15,35 +10,44 @@ scales:
   x: [1.00, 1.50, 512]
 
 backbone:
-  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
-  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, C3k2, [256, False, 0.25]]
-  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C3k2, [512, False, 0.25]] # 4-P3/8
-  - [-1, 1, GCBlock, [512]] # 5, GC-P3
-  - [-1, 1, Conv, [512, 3, 2]] # 6-P4/16
-  - [-1, 2, C3k2, [512, True]] # 7-P4/16
-  - [-1, 1, GCBlock, [512]] # 8, GC-P4
-  - [-1, 1, Conv, [1024, 3, 2]] # 9-P5/32
-  - [-1, 2, C3k2, [1024, True]] # 10
-  - [-1, 1, SPPF, [1024, 5]] # 11
-  - [-1, 2, C2PSA, [1024]] # 12
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]          # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]         # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]  # 2-P2/4
+  - [-1, 1, GCBlock, [256]]            # 3-GC-P2
+
+  - [-1, 1, Conv, [256, 3, 2]]         # 4-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]  # 5-P3/8
+  - [-1, 1, GCBlock, [512]]            # 6-GC-P3
+
+  - [-1, 1, Conv, [512, 3, 2]]         # 7-P4/16
+  - [-1, 2, C3k2, [512, True]]         # 8-P4/16
+  - [-1, 1, GCBlock, [512]]            # 9-GC-P4
+
+  - [-1, 1, Conv, [1024, 3, 2]]        # 10-P5/32
+  - [-1, 2, C3k2, [1024, True]]        # 11
+  - [-1, 1, SPPF, [1024, 5]]           # 12
+  - [-1, 2, C2PSA, [1024]]             # 13-P5/32
 
 head:
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 8], 1, FreqFusionLite, [512, 8]] # 14, frequency-aware P5/P4 fusion
-  - [-1, 2, C3k2, [512, False]] # 15
+  # P5 -> P4: keep original fusion, avoid full FreqFusion disturbance
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 14
+  - [[-1, 9], 1, Concat, [1]]                   # 15 cat GC-P4
+  - [-1, 2, C3k2, [512, False]]                 # 16
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 5], 1, FreqFusionLite, [256, 8]] # 17, frequency-aware P4/P3 fusion
-  - [-1, 2, C3k2, [256, False]] # 18 (P3/8-small)
+  # P4 -> P3: keep original fusion, protect Plastic Bottle weak boundary
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 17
+  - [[-1, 6], 1, Concat, [1]]                   # 18 cat GC-P3
+  - [-1, 2, C3k2, [256, False]]                 # 19 P3/8
 
-  - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 15], 1, FreqFusionLite, [512, 8]] # 20, frequency-aware P3/P4 fusion
-  - [-1, 2, C3k2, [512, False]] # 21 (P4/16-medium)
+  # P3 -> P4: FreqFusion-lite P4-only
+  - [-1, 1, Conv, [256, 3, 2]]                  # 20
+  - [[-1, 16], 1, FreqFusionLite, [512, 8]]     # 21 frequency-aware P4 fusion
+  - [-1, 2, C3k2, [512, False]]                 # 22 P4/16
 
-  - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 12], 1, FreqFusionLite, [1024, 8]] # 23, frequency-aware P4/P5 fusion
-  - [-1, 2, C3k2, [1024, True]] # 24 (P5/32-large)
+  # P4 -> P5: keep original fusion, protect strong class semantics
+  - [-1, 1, Conv, [512, 3, 2]]                  # 23
+  - [[-1, 13], 1, Concat, [1]]                  # 24 cat P5
+  - [-1, 2, C3k2, [1024, True]]                 # 25 P5/32
 
-  - [[18, 21, 24], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  - [[19, 22, 25], 1, Detect, [nc]]             # Detect(P3, P4, P5)

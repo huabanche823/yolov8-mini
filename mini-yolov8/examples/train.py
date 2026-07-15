@@ -15,7 +15,7 @@ def main():
     print(f"ultralytics source: {ultralytics.__file__}")
     # 加载模型配置文件或权重文件，若没有权重文件，会自动下载预训练权重
     # 改进不要加载预训练权重
-    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11_fusionfactor_neck.yaml") 
+    model = YOLO(ROOT / "ultralytics/cfg/models/v11/yolov11_gcblock.yaml") 
     results = model.train(
         data=ROOT / "datasets/WasteSortingv3/data_challenge.yaml",  # 数据集配置文件路径
         epochs=100,  # 训练轮数
@@ -27,7 +27,7 @@ def main():
         workers=4,  # 数据加载线程数，0 表示不使用子进程
         device=0,  # 使用 GPU 进行训练
         project=ROOT / "runs",  # 训练结果保存目录的父目录
-        name="WasteSortingv3_yolov11_fusionfactor_neck",  # 本次训练的实验名称
+        name="WasteSortingv3_yolov11_gcblockv5",  # 本次训练的实验名称
         exist_ok=True,  # 如果目录已存在，允许覆盖
         pretrained=False,  # 不使用预训练权重
         val=True,  # 训练时进行验证
@@ -108,5 +108,19 @@ YOLOv11 summary (fused): 101 layers, 2,583,127 parameters, 0 gradients, 6.3 GFLO
                 timber        192        430      0.879      0.882      0.917      0.673
 Speed: 3.0ms preprocess, 2.0ms inference, 0.0ms loss, 5.1ms postprocess per image
 Results saved to /root/yolov8-mini/mini-yolov8/runs/WasteSortingv3_yolov11_challenge
+
+
+
+YOLOv11_gcres_all summary (fused): 149 layers, 2,687,271 parameters, 0 gradients, 6.4 GFLOPs
+                 Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 100% ━━━━━━━━━━━━ 6/6 1.3s/it 7.7s
+                   all        355       1894      0.911      0.848      0.915      0.655
+                 Brick        219        399      0.947       0.89      0.948      0.694
+              Concrete        217        522      0.988      0.919      0.979      0.759
+        Plastic Bottle        129        231       0.89      0.823      0.909      0.595
+         Reinforcement        174        312      0.882      0.716      0.825      0.552
+                timber        192        430      0.847      0.893      0.915      0.674
+Speed: 1.3ms preprocess, 2.0ms inference, 0.0ms loss, 3.3ms postprocess per image
+Results saved to /root/yolov8-mini/mini-yolov8/runs/WasteSortingv3_yolov11_gcres_all
+
 
 """
