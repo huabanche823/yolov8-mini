@@ -75,6 +75,7 @@ __all__ = (
     "C3k2_SHSA",
     "C3k2_StarBlockLite",
     "CSPStageLite",
+    "FeaturePyramidSharedConv",
     "FeaturePyramidSharedConvLite",
     "C3x",
     "CBFuse",
@@ -434,6 +435,39 @@ class FeaturePyramidSharedConvLite(nn.Module):
         for _ in range(self.n):
             y = y + self.shared(y)
         return self.expand(y)
+
+
+class FeaturePyramidSharedConv(nn.Module):
+    """Paper-style FPSC using one recursively shared kernel at multiple dilation rates."""
+
+    def __init__(self, c1, c2, e=0.25, dilations=(1, 3, 5)):
+        """Reduce channels, build a shared-convolution pyramid, then fuse it."""
+        super().__init__()
+        c_ = max(int(c2 * e), 8)
+        self.reduce = Conv(c1, c_, 1, 1)
+        self.shared = nn.Conv2d(c_, c_, 3, stride=1, padding=1, bias=False)
+        self.dilations = tuple(int(d) for d in dilations)
+        if not self.dilations or any(d < 1 for d in self.dilations):
+            raise ValueError("FPSC dilations must be positive integers")
+        self.norms = nn.ModuleList(nn.BatchNorm2d(c_) for _ in self.dilations)
+        self.act = nn.SiLU(inplace=True)
+        self.fuse = Conv(c_ * (len(self.dilations) + 1), c2, 1, 1)
+
+    def forward(self, x):
+        """Apply the same 3x3 weights recursively with dilation rates 1, 3 and 5."""
+        y = self.reduce(x)
+        features = [y]
+        for dilation, norm in zip(self.dilations, self.norms):
+            y = F.conv2d(
+                y,
+                self.shared.weight,
+                stride=1,
+                padding=dilation,
+                dilation=dilation,
+            )
+            y = self.act(norm(y))
+            features.append(y)
+        return self.fuse(torch.cat(features, dim=1))
 
 
 
