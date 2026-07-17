@@ -148,6 +148,7 @@ CFG_FLOAT_KEYS = frozenset(
         "simota_center_radius",
         "simota_cls_weight",
         "simota_iou_weight",
+        "alpha_iou",
         "shape_iou_scale",
         "degrees",
         "shear",

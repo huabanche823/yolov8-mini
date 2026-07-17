@@ -173,6 +173,54 @@ def bbox_shape_iou_loss(
     return 1.0 - shape_iou, iou
 
 
+def bbox_alpha_ciou_loss(
+    box1: torch.Tensor, box2: torch.Tensor, alpha: float = 3.0, eps: float = 1e-7
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Alpha-CIoU loss for xyxy boxes.
+
+    Alpha-IoU applies a power transform to the overlap term and to the CIoU
+    geometric regularizers. Values greater than one emphasize high-IoU samples
+    without changing inference or evaluation IoU.
+    """
+    if alpha <= 0:
+        raise ValueError(f"Alpha-CIoU requires alpha > 0, but received {alpha}.")
+    (
+        b1_x1,
+        b1_y1,
+        b1_x2,
+        b1_y2,
+        b2_x1,
+        b2_y1,
+        b2_x2,
+        b2_y2,
+        w1,
+        h1,
+        w2,
+        h2,
+        iou,
+        cw,
+        ch,
+    ) = _box_parts_xyxy(box1, box2, eps)
+
+    center_dist = (
+        (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
+    ) * 0.25
+    enclosing_diag = cw.pow(2) + ch.pow(2)
+    distance_cost = center_dist.clamp(min=0).pow(alpha) / (
+        enclosing_diag.clamp(min=eps).pow(alpha) + eps
+    )
+
+    aspect_cost = (4.0 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
+    with torch.no_grad():
+        aspect_weight = aspect_cost / (1.0 - iou + aspect_cost + eps)
+    alpha_ciou = (
+        iou.clamp(min=eps).pow(alpha)
+        - distance_cost
+        - (aspect_cost * aspect_weight).clamp(min=eps).pow(alpha)
+    )
+    return 1.0 - alpha_ciou, iou
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -264,12 +312,21 @@ class DFLoss(nn.Module):
 class BboxLoss(nn.Module):
     """Criterion class for computing training losses for bounding boxes."""
 
-    def __init__(self, reg_max: int = 16, bbox_loss: str = "ciou", shape_iou_scale: float = 0.0):
+    def __init__(
+        self,
+        reg_max: int = 16,
+        bbox_loss: str = "ciou",
+        shape_iou_scale: float = 0.0,
+        alpha_iou: float = 3.0,
+    ):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
         self.dfl_loss = DFLoss(reg_max) if reg_max > 1 else None
         self.bbox_loss = _selected_bbox_loss_type(bbox_loss)
         self.shape_iou_scale = float(shape_iou_scale)
+        self.alpha_iou = float(alpha_iou)
+        if self.alpha_iou <= 0:
+            raise ValueError(f"alpha_iou must be > 0, but received {self.alpha_iou}.")
 
     def forward(
         self,
@@ -301,11 +358,16 @@ class BboxLoss(nn.Module):
                 pred_bboxes_fg * stride_fg, target_bboxes_fg * stride_fg, scale=self.shape_iou_scale
             )
             loss_iou = (bbox_loss * weight).sum() / target_scores_sum
+        elif loss_type == "alpha_ciou":
+            bbox_loss, iou = bbox_alpha_ciou_loss(pred_bboxes_fg, target_bboxes_fg, alpha=self.alpha_iou)
+            loss_iou = (bbox_loss * weight).sum() / target_scores_sum
         elif loss_type == "ciou":
             iou = bbox_iou(pred_bboxes_fg, target_bboxes_fg, xywh=False, CIoU=True)
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         else:
-            raise ValueError(f"Unsupported bbox_loss={loss_type!r}. Use ciou, wiou, mpdiou, or shape_iou.")
+            raise ValueError(
+                f"Unsupported bbox_loss={loss_type!r}. Use ciou, alpha_ciou, wiou, mpdiou, or shape_iou."
+            )
 
         # DFL loss
         if self.dfl_loss:
@@ -552,7 +614,10 @@ class v8DetectionLoss:
         if self.cls_loss_type not in {"bce", "focal"}:
             raise ValueError("Unsupported cls_loss={!r}. Use 'bce' or 'focal'.".format(self.cls_loss_type))
         self.bbox_loss = BboxLoss(
-            m.reg_max, bbox_loss=getattr(h, "bbox_loss", "ciou"), shape_iou_scale=getattr(h, "shape_iou_scale", 0.0)
+            m.reg_max,
+            bbox_loss=getattr(h, "bbox_loss", "ciou"),
+            shape_iou_scale=getattr(h, "shape_iou_scale", 0.0),
+            alpha_iou=getattr(h, "alpha_iou", 3.0),
         ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
