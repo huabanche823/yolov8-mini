@@ -33,6 +33,7 @@ __all__ = (
     "RTDETRDecoder",
     "Segment",
     "SemanticSegment",
+    "THeadLiteDetect",
     "TSCODELiteDetect",
     "YOLOEDetect",
     "YOLOESegment",
@@ -534,6 +535,130 @@ class ESEDetect(Detect):
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class _THeadLiteConv(nn.Module):
+    """Scale-stable depthwise-separable interaction layer for T-Head-Lite."""
+
+    def __init__(self, channels: int):
+        """Initialize a shared interaction layer without scale-dependent batch statistics."""
+        super().__init__()
+        groups = min(8, channels)
+        while channels % groups:
+            groups -= 1
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Refine one pyramid level with shared lightweight parameters."""
+        return self.block(x)
+
+
+class _TaskDecompositionLite(nn.Module):
+    """Decompose shared interaction features into one task-specific representation."""
+
+    def __init__(self, channels: int, num_layers: int):
+        """Initialize layer attention and spatial-channel alignment."""
+        super().__init__()
+        attention_channels = max(channels // 4, 16)
+        self.layer_attention = nn.Sequential(
+            nn.Conv2d(channels * num_layers, attention_channels, 1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(attention_channels, num_layers, 1),
+        )
+        self.alignment = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
+        """Fuse interaction layers and learn a task-specific alignment gate."""
+        pooled = torch.cat([F.adaptive_avg_pool2d(feature, 1) for feature in features], dim=1)
+        weights = self.layer_attention(pooled).softmax(dim=1)
+        stacked = torch.stack(features, dim=1)
+        fused = (stacked * weights.unsqueeze(2)).sum(dim=1)
+        return fused * (1.0 + self.alignment(fused).sigmoid())
+
+
+class THeadLiteDetect(Detect):
+    """YOLO Detect head with lightweight TOOD-style task alignment.
+
+    The adapter first builds shared task-interactive features, then derives
+    classification- and localization-specific representations through separate
+    layer attention and alignment gates. The standard YOLO DFL predictors and
+    decoder remain unchanged.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        num_layers: int = 3,
+        hidden: int = 64,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize the lightweight task-aligned detection head."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = max(int(hidden), 16)
+        num_layers = max(int(num_layers), 1)
+        self.task_lateral = nn.ModuleList(
+            Conv(c, hidden, 1) if c != hidden else nn.Identity() for c in ch
+        )
+        self.interaction_layers = nn.ModuleList(_THeadLiteConv(hidden) for _ in range(num_layers))
+        self.cls_decomposition = _TaskDecompositionLite(hidden, num_layers)
+        self.box_decomposition = _TaskDecompositionLite(hidden, num_layers)
+        self.cls_restore = nn.ModuleList(Conv(hidden, c, 1) if c != hidden else nn.Identity() for c in ch)
+        self.box_restore = nn.ModuleList(Conv(hidden, c, 1) if c != hidden else nn.Identity() for c in ch)
+        self.cls_scale = nn.Parameter(torch.full((self.nl,), 0.1))
+        self.box_scale = nn.Parameter(torch.full((self.nl,), 0.1))
+
+    def _aligned_features(self, x: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Create classification- and box-aligned features for every pyramid level."""
+        cls_features, box_features = [], []
+        for level, feature in enumerate(x):
+            y = self.task_lateral[level](feature)
+            interaction_features = []
+            for layer in self.interaction_layers:
+                y = layer(y)
+                interaction_features.append(y)
+            cls_task = self.cls_decomposition(interaction_features)
+            box_task = self.box_decomposition(interaction_features)
+            cls_features.append(feature + self.cls_scale[level] * self.cls_restore[level](cls_task))
+            box_features.append(feature + self.box_scale[level] * self.box_restore[level](box_task))
+        return cls_features, box_features
+
+    def _forward_aligned(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Run standard YOLO predictors on task-aligned feature maps."""
+        cls_features, box_features = self._aligned_features(x)
+        bs = x[0].shape[0]
+        boxes = torch.cat(
+            [box_head[i](box_features[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+        )
+        scores = torch.cat([cls_head[i](cls_features[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        return dict(boxes=boxes, scores=scores, feats=box_features)
+
+    def forward(self, x: list[torch.Tensor]):
+        """Predict boxes and classes from separately aligned task features."""
+        preds = self._forward_aligned(x, **self.one2many)
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self._forward_aligned(x_detach, **self.one2one)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
 
 
 class DyHeadLiteBlock(nn.Module):
