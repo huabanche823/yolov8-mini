@@ -161,6 +161,7 @@ CFG_FRACTION_KEYS = frozenset(
     {  # fractional float arguments with 0.0<=values<=1.0
         "dropout",
         "focal_alpha",
+        "interpiou_ratio",
         "lr0",
         "lrf",
         "momentum",

@@ -36,6 +36,8 @@ def _selected_bbox_loss_type(loss_type: str = "ciou") -> str:
     loss_type = str(loss_type or "ciou").replace("-", "_").lower()
     if loss_type in {"shapeiou", "shape_iou"}:
         return "shape_iou"
+    if loss_type in {"interpiou", "interp_iou"}:
+        return "interpiou"
     return loss_type
 
 
@@ -221,6 +223,27 @@ def bbox_alpha_ciou_loss(
     return 1.0 - alpha_ciou, iou
 
 
+def bbox_interpiou_loss(
+    box1: torch.Tensor, box2: torch.Tensor, ratio: float = 0.98, eps: float = 1e-7
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute static InterpIoU loss for aligned xyxy boxes.
+
+    An auxiliary box is linearly interpolated from the prediction toward its
+    target. The original and interpolated overlaps jointly provide the box
+    regression signal without adding center-distance or aspect-ratio penalties.
+    """
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"InterpIoU ratio must be in [0, 1], but received {ratio}.")
+
+    iou = bbox_iou(box1, box2, xywh=False, eps=eps).clamp(min=0.0, max=1.0)
+    # Match the official definition: ratio=1 makes the auxiliary box equal
+    # to the target, while ratio=0 leaves it equal to the prediction.
+    interp_box = box1 * (1.0 - ratio) + box2 * ratio
+    interp_iou = bbox_iou(interp_box, box2, xywh=False, eps=eps).clamp(min=0.0, max=1.0)
+    # InterpIoU = IoU(pred, target) + IoU(interp, target) - 1.
+    return 2.0 - iou - interp_iou, iou
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -318,6 +341,7 @@ class BboxLoss(nn.Module):
         bbox_loss: str = "ciou",
         shape_iou_scale: float = 0.0,
         alpha_iou: float = 3.0,
+        interpiou_ratio: float = 0.98,
     ):
         """Initialize the BboxLoss module with regularization maximum and DFL settings."""
         super().__init__()
@@ -325,8 +349,11 @@ class BboxLoss(nn.Module):
         self.bbox_loss = _selected_bbox_loss_type(bbox_loss)
         self.shape_iou_scale = float(shape_iou_scale)
         self.alpha_iou = float(alpha_iou)
+        self.interpiou_ratio = float(interpiou_ratio)
         if self.alpha_iou <= 0:
             raise ValueError(f"alpha_iou must be > 0, but received {self.alpha_iou}.")
+        if not 0.0 <= self.interpiou_ratio <= 1.0:
+            raise ValueError(f"interpiou_ratio must be in [0, 1], but received {self.interpiou_ratio}.")
 
     def forward(
         self,
@@ -361,12 +388,19 @@ class BboxLoss(nn.Module):
         elif loss_type == "alpha_ciou":
             bbox_loss, iou = bbox_alpha_ciou_loss(pred_bboxes_fg, target_bboxes_fg, alpha=self.alpha_iou)
             loss_iou = (bbox_loss * weight).sum() / target_scores_sum
+        elif loss_type == "interpiou":
+            bbox_loss, iou = bbox_interpiou_loss(
+                pred_bboxes_fg, target_bboxes_fg, ratio=self.interpiou_ratio
+            )
+            loss_iou = (bbox_loss * weight).sum() / target_scores_sum
         elif loss_type == "ciou":
             iou = bbox_iou(pred_bboxes_fg, target_bboxes_fg, xywh=False, CIoU=True)
             loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
         else:
             raise ValueError(
-                f"Unsupported bbox_loss={loss_type!r}. Use ciou, alpha_ciou, wiou, mpdiou, or shape_iou."
+                "Unsupported bbox_loss={!r}. Use ciou, alpha_ciou, interpiou, wiou, mpdiou, or shape_iou.".format(
+                    loss_type
+                )
             )
 
         # DFL loss
@@ -618,6 +652,7 @@ class v8DetectionLoss:
             bbox_loss=getattr(h, "bbox_loss", "ciou"),
             shape_iou_scale=getattr(h, "shape_iou_scale", 0.0),
             alpha_iou=getattr(h, "alpha_iou", 3.0),
+            interpiou_ratio=getattr(h, "interpiou_ratio", 0.98),
         ).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 

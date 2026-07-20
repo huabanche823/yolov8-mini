@@ -100,6 +100,8 @@ __all__ = (
     "FDConv",
     "GAM",
     "GCBlock",
+    "GRNBlock",
+    "MobileViTv2SSA",
     "GCConv",
     "GhostBottleneck",
     "HGBlock",
@@ -2034,6 +2036,48 @@ class GCBlock(nn.Module):
         """Recalibrate features with global context while preserving residual content."""
         x = self.proj(x)
         return x + self.channel_add(self.spatial_pool(x))
+
+
+class GRNBlock(nn.Module):
+    """ConvNeXt V2 Global Response Normalization for NCHW backbone features."""
+
+    def __init__(self, c1: int, c2: int | None = None, eps: float = 1e-6):
+        """Initialize a channel-preserving GRN block with an optional input projection."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.gamma = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, c2, 1, 1))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize spatial response magnitudes relative to the channel mean."""
+        x = self.proj(x)
+        gx = torch.norm(x, p=2, dim=(2, 3), keepdim=True)
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        return x + self.gamma * (x * nx) + self.beta
+
+
+class MobileViTv2SSA(nn.Module):
+    """Residual MobileViTv2 separable self-attention adapted to NCHW backbone features."""
+
+    def __init__(self, c1: int, c2: int | None = None):
+        """Initialize linear-complexity spatial attention with identity-safe residual scaling."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        self.proj = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+        self.qkv_proj = nn.Conv2d(c2, 1 + 2 * c2, 1, bias=True)
+        self.out_proj = nn.Conv2d(c2, c2, 1, bias=True)
+        self.gamma = nn.Parameter(torch.zeros(1, c2, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Pool a global key context and modulate every spatial value token with it."""
+        x = self.proj(x)
+        query, key, value = torch.split(self.qkv_proj(x), (1, x.shape[1], x.shape[1]), dim=1)
+        context_scores = torch.softmax(query.flatten(2), dim=-1).view_as(query)
+        context_vector = (key * context_scores).sum(dim=(2, 3), keepdim=True)
+        attended = self.out_proj(F.relu(value, inplace=False) * context_vector)
+        return x + self.gamma * attended
 
 
 class MCAContext(nn.Module):

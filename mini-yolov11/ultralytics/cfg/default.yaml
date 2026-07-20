@@ -113,8 +113,9 @@ focal_alpha: 0.25 # (float) Focal Loss alpha; only used when cls_loss=focal
 simota_center_radius: 0.0 # (float) optional center-region ratio for SimOTA candidates; 0 disables center prior
 simota_cls_weight: 1.0 # (float) SimOTA classification cost weight
 simota_iou_weight: 3.0 # (float) SimOTA IoU cost weight
-bbox_loss: ciou # (str) bbox regression loss: ciou, alpha_ciou, wiou, mpdiou, shape_iou
+bbox_loss: ciou # (str) bbox regression loss: ciou, alpha_ciou, interpiou, wiou, mpdiou, shape_iou
 alpha_iou: 3.0 # (float) Alpha-CIoU power; only used when bbox_loss=alpha_ciou
+interpiou_ratio: 0.98 # (float) interpolation coefficient in [0, 1]; only used when bbox_loss=interpiou
 shape_iou_scale: 0.0 # (float) Shape-IoU scale factor; only used when bbox_loss=shape_iou
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
