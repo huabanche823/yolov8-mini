@@ -23,6 +23,7 @@ from .utils import bias_init_with_prob, linear_init
 __all__ = (
     "OBB",
     "Classify",
+    "DGQPDetect",
     "Detect",
     "DyHeadLiteDetect",
     "ESEDetect",
@@ -267,6 +268,77 @@ class Detect(nn.Module):
     def fuse(self) -> None:
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+
+
+class _DistributionGuidedQualityPredictor(nn.Module):
+    """Estimate localization quality from the statistics of one DFL distribution map."""
+
+    def __init__(self, reg_max: int, topk: int = 4, hidden: int = 64):
+        """Initialize the lightweight GFLv2-style distribution-guided predictor."""
+        super().__init__()
+        self.reg_max = int(reg_max)
+        self.topk = min(max(int(topk), 1), self.reg_max)
+        statistic_channels = 4 * (self.topk + 1)
+        self.predictor = nn.Sequential(
+            nn.Conv2d(statistic_channels, int(hidden), 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(int(hidden), 1, 1),
+        )
+
+    def forward(self, box_logits: torch.Tensor) -> torch.Tensor:
+        """Predict a scalar quality logit at each location from four DFL distributions."""
+        bs, _, height, width = box_logits.shape
+        probabilities = box_logits.view(bs, 4, self.reg_max, height, width).softmax(dim=2)
+        topk_values = probabilities.topk(self.topk, dim=2).values
+        statistics = torch.cat((topk_values, topk_values.mean(dim=2, keepdim=True)), dim=2)
+        return self.predictor(statistics.flatten(1, 2))
+
+
+class DGQPDetect(Detect):
+    """YOLO Detect head with GFLv2-style distribution-guided localization quality calibration.
+
+    The standard YOLO box and class towers are retained. A shared lightweight predictor reads
+    top-k statistics from the four DFL distributions and estimates one localization-quality score
+    per location. The class probability is multiplied by this quality score during both training
+    and inference, allowing the existing quality-weighted classification targets to supervise the
+    new branch without changing the detector loss interface.
+    """
+
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize the distribution-guided quality-aware detection head."""
+        super().__init__(nc, reg_max, end2end, ch)
+        self.quality_predictor = _DistributionGuidedQualityPredictor(reg_max, topk=4, hidden=64)
+
+    @staticmethod
+    def _calibrated_logits(class_logits: torch.Tensor, quality_logits: torch.Tensor) -> torch.Tensor:
+        """Return logits whose sigmoid equals sigmoid(class) multiplied by sigmoid(quality)."""
+        output_dtype = class_logits.dtype
+        log_probability = F.logsigmoid(class_logits.float()) + F.logsigmoid(quality_logits.float())
+        probability = log_probability.exp().clamp(max=1.0 - 1e-6)
+        return (log_probability - torch.log1p(-probability)).to(output_dtype)
+
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+    ) -> dict[str, torch.Tensor]:
+        """Predict DFL boxes and quality-calibrated class logits at all pyramid levels."""
+        if box_head is None or cls_head is None:
+            return dict()
+        bs = x[0].shape[0]
+        level_boxes = [box_head[i](x[i]) for i in range(self.nl)]
+        level_scores = [cls_head[i](x[i]) for i in range(self.nl)]
+        level_quality = [self.quality_predictor(boxes) for boxes in level_boxes]
+        boxes = torch.cat([boxes.view(bs, 4 * self.reg_max, -1) for boxes in level_boxes], dim=-1)
+        raw_scores = torch.cat([scores.view(bs, self.nc, -1) for scores in level_scores], dim=-1)
+        quality = torch.cat([score.view(bs, 1, -1) for score in level_quality], dim=-1)
+        scores = self._calibrated_logits(raw_scores, quality)
+        return dict(boxes=boxes, scores=scores, feats=x, raw_scores=raw_scores, quality=quality)
+
+    def bias_init(self):
+        """Initialize standard prediction biases and start quality calibration near identity."""
+        super().bias_init()
+        final = self.quality_predictor.predictor[-1]
+        nn.init.zeros_(final.weight)
+        nn.init.constant_(final.bias, 2.0)
 
 
 class GhostHeadDetect(Detect):
