@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -77,6 +79,10 @@ __all__ = (
     "CSPStageLite",
     "FeaturePyramidSharedConv",
     "FeaturePyramidSharedConvLite",
+    "HyperACEFullPADNeck",
+    "NeckFeatureSelect",
+    "SFEWPFPNNeck",
+    "SPAFPNC3k2Neck",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -4057,6 +4063,391 @@ class AFPNFuse2(nn.Module):
         weight_1 = self.weight1(x1)
         weights = torch.softmax(self.weight_levels(torch.cat((weight_0, weight_1), 1)), dim=1)
         return self.refine(x0 * weights[:, 0:1] + x1 * weights[:, 1:2])
+
+
+def _resize_neck_feature(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    """Resize a pyramid feature while avoiding interpolation aliases during downsampling."""
+    if x.shape[2:] == size:
+        return x
+    if x.shape[-2] > size[0] or x.shape[-1] > size[1]:
+        return F.adaptive_avg_pool2d(x, size)
+    return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+
+
+class NeckFeatureSelect(nn.Module):
+    """Select one tensor from a multi-output neck for use in a YAML model graph."""
+
+    def __init__(self, index: int):
+        """Initialize a zero-parameter output selector."""
+        super().__init__()
+        self.index = int(index)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Return the requested P3, P4, or P5 feature."""
+        return x[self.index]
+
+
+class _SPAFPNPyramidFusion(nn.Module):
+    """Lightweight P3/P4/P5 intersection used by SPAFPN Pyramid Fusion."""
+
+    def __init__(self, channels: list[int] | tuple[int, int, int], c2: int):
+        super().__init__()
+        assert len(channels) == 3, "SPAFPN Pyramid Fusion expects P3, P4, and P5"
+        self.align = nn.ModuleList(Conv(c, c2, 1, 1) for c in channels)
+        self.fuse = Conv(c2 * 3, c2, 1, 1)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        target_size = x[1].shape[2:]
+        features = [_resize_neck_feature(conv(feature), target_size) for conv, feature in zip(self.align, x)]
+        return self.fuse(torch.cat(features, dim=1))
+
+
+class _SPAFPNMultiConcat(nn.Module):
+    """Decouple a SPAFPN global feature back to one pyramid scale."""
+
+    def __init__(self, local_c: int, global_c: int, c2: int, adjacent_c: int | None = None):
+        super().__init__()
+        local_in = local_c + (adjacent_c or 0)
+        self.local_conv = Conv(local_in, c2, 1, 1)
+        self.global_conv = Conv(global_c, c2, 1, 1)
+        self.has_adjacent = adjacent_c is not None
+
+    def forward(
+        self,
+        local: torch.Tensor,
+        global_feature: torch.Tensor,
+        adjacent: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        target_size = local.shape[2:]
+        if self.has_adjacent:
+            if adjacent is None:
+                raise ValueError("SPAFPN Multi-Concat requires an adjacent-scale feature")
+            adjacent = _resize_neck_feature(adjacent, target_size)
+            local = torch.cat((local, adjacent), dim=1)
+        local = self.local_conv(local)
+        global_feature = self.global_conv(_resize_neck_feature(global_feature, target_size))
+        return local + local * global_feature
+
+
+class SPAFPNC3k2Neck(nn.Module):
+    """SPAFPN neck adapted to YOLO11 with C3k2 decoupling blocks.
+
+    The topology follows SPAFPN's two-stage ``Pyramid Fusion -> Multi-Concat``
+    design. Standard pooling/interpolation replaces the paper repository's
+    optional DCNv3 and DySample operators so this ablation remains portable to
+    the project's CPU-only validation environment.
+    """
+
+    def __init__(
+        self,
+        in_channels: list[int] | tuple[int, int, int],
+        out_channels: list[int] | tuple[int, int, int],
+        n: int = 1,
+    ):
+        super().__init__()
+        assert len(in_channels) == len(out_channels) == 3, "SPAFPN expects three pyramid levels"
+        c3, c4, c5 = (int(c) for c in out_channels)
+        n = max(int(n), 1)
+        self.input_proj = nn.ModuleList(Conv(c1, c2, 1, 1) for c1, c2 in zip(in_channels, out_channels))
+
+        self.fusion_td = _SPAFPNPyramidFusion((c3, c4, c5), c4)
+        self.td_p5 = _SPAFPNMultiConcat(c5, c4, c5)
+        self.td_p4 = _SPAFPNMultiConcat(c4, c4, c4, adjacent_c=c5)
+        self.td_p3 = _SPAFPNMultiConcat(c3, c4, c3, adjacent_c=c4)
+        self.td_refine = nn.ModuleList(
+            (C3k2(c5, c5, n, True), C3k2(c4, c4, n, False), C3k2(c3, c3, n, False))
+        )
+
+        self.fusion_bu = _SPAFPNPyramidFusion((c3, c4, c5), c4)
+        self.bu_p3 = _SPAFPNMultiConcat(c3, c4, c3)
+        self.bu_p4 = _SPAFPNMultiConcat(c4, c4, c4, adjacent_c=c3)
+        self.bu_p5 = _SPAFPNMultiConcat(c5, c4, c5, adjacent_c=c4)
+        self.bu_refine = nn.ModuleList(
+            (C3k2(c3, c3, n, False), C3k2(c4, c4, n, False), C3k2(c5, c5, n, True))
+        )
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+        """Return SPAFPN-enhanced P3, P4, and P5 features."""
+        p3, p4, p5 = [proj(feature) for proj, feature in zip(self.input_proj, x)]
+
+        global_td = self.fusion_td((p3, p4, p5))
+        td5 = self.td_refine[0](self.td_p5(p5, global_td))
+        td4 = self.td_refine[1](self.td_p4(p4, global_td, td5))
+        td3 = self.td_refine[2](self.td_p3(p3, global_td, td4))
+
+        global_bu = self.fusion_bu((td3, td4, td5))
+        out3 = self.bu_refine[0](self.bu_p3(td3, global_bu))
+        out4 = self.bu_refine[1](self.bu_p4(td4, global_bu, out3))
+        out5 = self.bu_refine[2](self.bu_p5(td5, global_bu, out4))
+        return [out3, out4, out5]
+
+
+class _AdaHyperedgeGenerator(nn.Module):
+    """Generate YOLOv13-style adaptive hyperedge participation weights."""
+
+    def __init__(
+        self,
+        node_dim: int,
+        num_hyperedges: int = 4,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        context: str = "both",
+    ):
+        super().__init__()
+        if node_dim % num_heads:
+            raise ValueError("HyperACE node_dim must be divisible by num_heads")
+        if context not in {"mean", "max", "both"}:
+            raise ValueError("HyperACE context must be 'mean', 'max', or 'both'")
+        self.num_heads = num_heads
+        self.num_hyperedges = num_hyperedges
+        self.head_dim = node_dim // num_heads
+        self.context = context
+        self.prototype_base = nn.Parameter(torch.empty(num_hyperedges, node_dim))
+        nn.init.xavier_uniform_(self.prototype_base)
+        context_dim = node_dim * 2 if context == "both" else node_dim
+        self.context_net = nn.Linear(context_dim, num_hyperedges * node_dim)
+        self.pre_head_proj = nn.Linear(node_dim, node_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.scaling = math.sqrt(self.head_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, nodes, dim = x.shape
+        if self.context == "mean":
+            context = x.mean(dim=1)
+        elif self.context == "max":
+            context = x.max(dim=1).values
+        else:
+            context = torch.cat((x.mean(dim=1), x.max(dim=1).values), dim=-1)
+        offsets = self.context_net(context).view(b, self.num_hyperedges, dim)
+        prototypes = self.prototype_base.unsqueeze(0) + offsets
+        node_heads = self.pre_head_proj(x).view(b, nodes, self.num_heads, self.head_dim).transpose(1, 2)
+        edge_heads = prototypes.view(b, self.num_hyperedges, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        logits = torch.matmul(node_heads, edge_heads.transpose(-1, -2)) / self.scaling
+        logits = self.dropout(logits.mean(dim=1))
+        return F.softmax(logits, dim=1)
+
+
+class _AdaptiveHypergraphConv(nn.Module):
+    """Aggregate vertices to hyperedges and distribute them back to vertices."""
+
+    def __init__(self, channels: int, num_hyperedges: int, dropout: float = 0.1):
+        super().__init__()
+        heads = max(channels // 16, 1)
+        while channels % heads:
+            heads -= 1
+        self.edge_generator = _AdaHyperedgeGenerator(channels, num_hyperedges, heads, dropout, "both")
+        self.edge_proj = nn.Sequential(nn.Linear(channels, channels), nn.GELU())
+        self.node_proj = nn.Sequential(nn.Linear(channels, channels), nn.GELU())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        nodes = x.flatten(2).transpose(1, 2)
+        assignment = self.edge_generator(nodes)
+        edges = self.edge_proj(torch.bmm(assignment.transpose(1, 2), nodes))
+        nodes = self.node_proj(torch.bmm(assignment, edges)) + nodes
+        return nodes.transpose(1, 2).reshape(b, c, h, w)
+
+
+class _HyperACEC3AH(nn.Module):
+    """CSP-style adaptive hypergraph branch from HyperACE."""
+
+    def __init__(self, channels: int, num_hyperedges: int):
+        super().__init__()
+        self.cv1 = Conv(channels, channels, 1, 1)
+        self.cv2 = Conv(channels, channels, 1, 1)
+        self.hypergraph = _AdaptiveHypergraphConv(channels, num_hyperedges)
+        self.cv3 = Conv(channels * 2, channels, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.cv3(torch.cat((self.hypergraph(self.cv1(x)), self.cv2(x)), dim=1))
+
+
+class _HyperACEDepthwiseBottleneck(nn.Module):
+    """CPU-portable depthwise-separable low-order branch for HyperACE."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            DWConv(channels, channels, 3, 1),
+            Conv(channels, channels, 1, 1),
+            DWConv(channels, channels, 7, 1),
+            Conv(channels, channels, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+class _HyperACECore(nn.Module):
+    """Fuse three scales and model high- and low-order correlations."""
+
+    def __init__(
+        self,
+        channels: list[int] | tuple[int, int, int],
+        c2: int,
+        num_hyperedges: int = 4,
+        n: int = 1,
+        expansion: float = 0.5,
+    ):
+        super().__init__()
+        hidden = max(int(c2 * expansion), 16)
+        hidden = max(round(hidden / 16) * 16, 16)
+        self.fuse = Conv(sum(channels), c2, 1, 1)
+        self.cv1 = Conv(c2, hidden * 3, 1, 1)
+        self.branch1 = _HyperACEC3AH(hidden, num_hyperedges)
+        self.branch2 = _HyperACEC3AH(hidden, num_hyperedges)
+        self.low_order = nn.ModuleList(_HyperACEDepthwiseBottleneck(hidden) for _ in range(max(int(n), 1)))
+        self.cv2 = Conv(hidden * (4 + len(self.low_order)), c2, 1, 1)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
+        target_size = x[1].shape[2:]
+        fused = self.fuse(torch.cat([_resize_neck_feature(feature, target_size) for feature in x], dim=1))
+        features = list(self.cv1(fused).chunk(3, dim=1))
+        high_order_1 = self.branch1(features[1])
+        high_order_2 = self.branch2(features[1])
+        features.extend(block(features[-1]) for block in self.low_order)
+        features[1] = high_order_1
+        features.append(high_order_2)
+        return self.cv2(torch.cat(features, dim=1))
+
+
+class _FullPADTunnel(nn.Module):
+    """Zero-initialized gated residual distribution from YOLOv13 FullPAD."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, original: torch.Tensor, enhanced: torch.Tensor) -> torch.Tensor:
+        return original + self.gate * enhanced
+
+
+class HyperACEFullPADNeck(nn.Module):
+    """Neck-only HyperACE and FullPAD adaptation for a GRN4 YOLO11 backbone."""
+
+    def __init__(
+        self,
+        in_channels: list[int] | tuple[int, int, int],
+        out_channels: list[int] | tuple[int, int, int],
+        num_hyperedges: int = 4,
+        n: int = 1,
+    ):
+        super().__init__()
+        assert len(in_channels) == len(out_channels) == 3, "HyperACE neck expects three pyramid levels"
+        c3, c4, c5 = (int(c) for c in out_channels)
+        n = max(int(n), 1)
+        self.input_proj = nn.ModuleList(Conv(c1, c2, 1, 1) for c1, c2 in zip(in_channels, out_channels))
+        self.hyperace = _HyperACECore((c3, c4, c5), c4, int(num_hyperedges), n)
+        self.ace_to_p3 = Conv(c4, c3, 1, 1)
+        self.ace_to_p5 = Conv(c4, c5, 1, 1)
+        self.input_tunnels = nn.ModuleList(_FullPADTunnel() for _ in range(3))
+        self.neck_tunnels = nn.ModuleList(_FullPADTunnel() for _ in range(4))
+
+        self.top_p4 = C3k2(c5 + c4, c4, n, False)
+        self.top_p3 = C3k2(c4 + c3, c3, n, False)
+        self.down_p3 = Conv(c3, c3, 3, 2)
+        self.bottom_p4 = C3k2(c3 + c4, c4, n, False)
+        self.down_p4 = Conv(c4, c4, 3, 2)
+        self.bottom_p5 = C3k2(c4 + c5, c5, n, True)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+        """Return FullPAD-distributed P3, P4, and P5 neck outputs."""
+        p3, p4, p5 = [proj(feature) for proj, feature in zip(self.input_proj, x)]
+        ace = self.hyperace((p3, p4, p5))
+        ace3 = self.ace_to_p3(_resize_neck_feature(ace, p3.shape[2:]))
+        ace5 = self.ace_to_p5(_resize_neck_feature(ace, p5.shape[2:]))
+        p3 = self.input_tunnels[0](p3, ace3)
+        p4 = self.input_tunnels[1](p4, ace)
+        p5 = self.input_tunnels[2](p5, ace5)
+
+        top4 = self.top_p4(torch.cat((_resize_neck_feature(p5, p4.shape[2:]), p4), dim=1))
+        top4 = self.neck_tunnels[0](top4, ace)
+        top3 = self.top_p3(torch.cat((_resize_neck_feature(top4, p3.shape[2:]), p3), dim=1))
+        top3 = self.neck_tunnels[1](top3, ace3)
+        out4 = self.bottom_p4(torch.cat((self.down_p3(top3), top4), dim=1))
+        out4 = self.neck_tunnels[2](out4, ace)
+        out5 = self.bottom_p5(torch.cat((self.down_p4(out4), p5), dim=1))
+        out5 = self.neck_tunnels[3](out5, ace5)
+        return [top3, out4, out5]
+
+
+class _SelectiveFusionElimination(nn.Module):
+    """Select complementary cross-level information and suppress redundant responses."""
+
+    def __init__(self, local_c: int, source_c: int, c2: int):
+        super().__init__()
+        self.local_proj = Conv(local_c, c2, 1, 1)
+        self.source_proj = Conv(source_c, c2, 1, 1)
+        self.context = DWConv(c2 * 2, c2 * 2, 3, 1)
+        self.gates = nn.Conv2d(c2 * 2, c2 * 2, 1, 1, 0)
+        self.refine = Conv(c2, c2, 3, 1)
+
+    def forward(self, local: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        target_size = local.shape[2:]
+        local = self.local_proj(local)
+        source = self.source_proj(_resize_neck_feature(source, target_size))
+        retain_gate, complement_gate = self.gates(self.context(torch.cat((local, source), dim=1))).sigmoid().chunk(2, 1)
+        return self.refine(local * retain_gate + source * complement_gate)
+
+
+class _WeightedParallelAggregation(nn.Module):
+    """Learn a normalized balance between top-down and bottom-up SFE paths."""
+
+    def __init__(self, channels: int, n: int):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(2))
+        self.refine = C3k2(channels, channels, n, False)
+
+    def forward(self, top_down: torch.Tensor, bottom_up: torch.Tensor) -> torch.Tensor:
+        weights = torch.softmax(self.weights, dim=0)
+        return self.refine(top_down * weights[0] + bottom_up * weights[1])
+
+
+class SFEWPFPNNeck(nn.Module):
+    """YOLO neck-only adaptation of WPDFPN's SFE and weighted parallel FPN.
+
+    Classification/localization decoupling and the original two-stage detector
+    head are deliberately excluded so the experiment changes only the neck.
+    """
+
+    def __init__(
+        self,
+        in_channels: list[int] | tuple[int, int, int],
+        out_channels: list[int] | tuple[int, int, int],
+        n: int = 1,
+    ):
+        super().__init__()
+        assert len(in_channels) == len(out_channels) == 3, "SFE-WPFPN expects three pyramid levels"
+        c3, c4, c5 = (int(c) for c in out_channels)
+        n = max(int(n), 1)
+        self.input_proj = nn.ModuleList(Conv(c1, c2, 1, 1) for c1, c2 in zip(in_channels, out_channels))
+
+        self.td_p4 = _SelectiveFusionElimination(c4, c5, c4)
+        self.td_p3 = _SelectiveFusionElimination(c3, c4, c3)
+        self.bu_p4 = _SelectiveFusionElimination(c4, c3, c4)
+        self.bu_p5 = _SelectiveFusionElimination(c5, c4, c5)
+        self.aggregate = nn.ModuleList(
+            (
+                _WeightedParallelAggregation(c3, n),
+                _WeightedParallelAggregation(c4, n),
+                _WeightedParallelAggregation(c5, n),
+            )
+        )
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, ...]) -> list[torch.Tensor]:
+        """Run top-down and bottom-up SFE paths in parallel and aggregate them."""
+        p3, p4, p5 = [proj(feature) for proj, feature in zip(self.input_proj, x)]
+        td5 = p5
+        td4 = self.td_p4(p4, td5)
+        td3 = self.td_p3(p3, td4)
+        bu3 = p3
+        bu4 = self.bu_p4(p4, bu3)
+        bu5 = self.bu_p5(p5, bu4)
+        return [
+            self.aggregate[0](td3, bu3),
+            self.aggregate[1](td4, bu4),
+            self.aggregate[2](td5, bu5),
+        ]
 
 
 class ZPool(nn.Module):

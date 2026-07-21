@@ -77,7 +77,11 @@ from ultralytics.nn.modules import (
     CSPStageLite,
     FeaturePyramidSharedConv,
     FeaturePyramidSharedConvLite,
+    HyperACEFullPADNeck,
+    NeckFeatureSelect,
     PConvFasterC3k2,
+    SFEWPFPNNeck,
+    SPAFPNC3k2Neck,
     C3x,
     CBFuse,
     CBLinear,
@@ -1985,6 +1989,14 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c2 = make_divisible(min(c2, max_channels) * width, 8)
             args = [c1, c2, *args[1:]]
+        elif m in frozenset({SPAFPNC3k2Neck, HyperACEFullPADNeck, SFEWPFPNNeck}):
+            c1 = [ch[x] for x in f]
+            c2 = [make_divisible(min(c, max_channels) * width, 8) for c in args[0]]
+            args = [c1, c2, *args[1:]]
+        elif m is NeckFeatureSelect:
+            index = int(args[0])
+            c2 = ch[f][index]
+            args = [index]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
