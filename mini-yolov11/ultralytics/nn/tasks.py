@@ -45,6 +45,7 @@ from ultralytics.nn.modules import (
     C2fFusedMBConv,
     C3Ghost,
     C3k2,
+    D3C2f,
     C3k2PKI,
     C3k2_CAAResidual,
     C3k2_CrossConvLite,
@@ -106,6 +107,7 @@ from ultralytics.nn.modules import (
     DWConv,
     DWConvTranspose2d,
     ESEDetect,
+    ETHeadLiteDetect,
     FreqFusionLite,
     FusionFactor,
     Focus,
@@ -134,8 +136,10 @@ from ultralytics.nn.modules import (
     ODConv,
     Pose,
     Pose26,
+    RTMDetSepBNDetect,
     RepC3,
     RepConv,
+    RepDown,
     RepNCSPELAN4,
     RepVGGDW,
     ResCBAM,
@@ -148,6 +152,7 @@ from ultralytics.nn.modules import (
     Segment26,
     SemanticSegment,
     THeadLiteDetect,
+    THeadLiteDirectDetect,
     TSCODECrossScaleLiteDetect,
     TSCODELiteDetect,
     StripEnhance,
@@ -333,6 +338,9 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepConv):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
+                if isinstance(m, RepDown):
+                    m.fuse_convs()
+                    m.forward = m.forward_fuse
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
@@ -1781,6 +1789,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            D3C2f,
             C3k2PKI,
             C3k2_CAAResidual,
             C3k2_CrossConvLite,
@@ -1815,6 +1824,7 @@ def parse_model(d, ch, verbose=True):
             FeaturePyramidSharedConvLite,
             PConvFasterC3k2,
             WTConvDown,
+            RepDown,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1856,6 +1866,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            D3C2f,
             C3k2PKI,
             C3k2_CAAResidual,
             C3k2_CrossConvLite,
@@ -2019,10 +2030,13 @@ def parse_model(d, ch, verbose=True):
                 DGQPDetect,
                 DyHeadLiteDetect,
                 ESEDetect,
+                ETHeadLiteDetect,
                 GhostHeadDetect,
                 LEDHDetect,
                 OAHeadLiteDetect,
+                RTMDetSepBNDetect,
                 THeadLiteDetect,
+                THeadLiteDirectDetect,
                 TSCODECrossScaleLiteDetect,
                 TSCODELiteDetect,
                 WorldDetect,
@@ -2045,10 +2059,13 @@ def parse_model(d, ch, verbose=True):
                 DGQPDetect,
                 DyHeadLiteDetect,
                 ESEDetect,
+                ETHeadLiteDetect,
                 GhostHeadDetect,
                 LEDHDetect,
                 OAHeadLiteDetect,
+                RTMDetSepBNDetect,
                 THeadLiteDetect,
+                THeadLiteDirectDetect,
                 TSCODECrossScaleLiteDetect,
                 TSCODELiteDetect,
                 YOLOEDetect,

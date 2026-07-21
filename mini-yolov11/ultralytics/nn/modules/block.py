@@ -47,6 +47,8 @@ __all__ = (
     "PConvFasterC3k2",
     "C3Ghost",
     "C3k2",
+    "D3Block",
+    "D3C2f",
     "C3k2PKI",
     "C3k2_CrossConvLite",
     "C3k2_DDFM",
@@ -123,6 +125,7 @@ __all__ = (
     "Proto",
     "RFAConv",
     "RepC3",
+    "RepDown",
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResCBAM",
@@ -2955,6 +2958,49 @@ class C3k2(C2f):
         )
 
 
+class D3Block(nn.Module):
+    """YOLO-ULM D3 block with cascaded depthwise and large-kernel convolutions."""
+
+    def __init__(self, c: int, shortcut: bool = True, k: int = 7):
+        """Initialize a D3 block.
+
+        The spatial path follows the paper's three-depthwise-convolution design:
+        pointwise + 3x3 DWConv, large-kernel DWConv, then pointwise + 3x3
+        DWConv. The residual is enabled when requested.
+        """
+        super().__init__()
+        if k < 3 or k % 2 == 0:
+            raise ValueError(f"D3Block kernel size must be odd and >= 3, got {k}")
+        self.pw1 = Conv(c, c, 1, 1)
+        self.dw1 = Conv(c, c, 3, 1, g=c)
+        self.dw_large = Conv(c, c, k, 1, g=c)
+        self.pw2 = Conv(c, c, 1, 1)
+        self.dw2 = Conv(c, c, 3, 1, g=c)
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply cascaded local-global-local feature extraction."""
+        y = self.dw2(self.pw2(self.dw_large(self.dw1(self.pw1(x)))))
+        return x + y if self.add else y
+
+
+class D3C2f(C2f):
+    """C2f feature aggregation using YOLO-ULM D3 blocks."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        shortcut: bool = True,
+        k: int = 7,
+        e: float = 0.5,
+    ):
+        """Initialize D3C2f with configurable large-kernel size."""
+        super().__init__(c1, c2, n=n, shortcut=shortcut, g=1, e=e)
+        self.m = nn.ModuleList(D3Block(self.c, shortcut=shortcut, k=k) for _ in range(n))
+
+
 
 
 class ContextAnchorAttention(nn.Module):
@@ -5611,6 +5657,69 @@ class C2fPSA(C2f):
         assert c1 == c2
         super().__init__(c1, c2, n=n, e=e)
         self.m = nn.ModuleList(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n))
+
+
+class RepDown(nn.Module):
+    """YOLO-ULM reparameterizable parallel downsampling block."""
+
+    def __init__(self, c1: int, c2: int, k: int = 7, s: int = 2):
+        """Initialize pointwise projection and parallel 7x7/3x3 depthwise branches."""
+        super().__init__()
+        if k < 3 or k % 2 == 0:
+            raise ValueError(f"RepDown kernel size must be odd and >= 3, got {k}")
+        self.k = k
+        self.s = s
+        self.c2 = c2
+        self.pw = Conv(c1, c2, 1, 1)
+        self.dw_large = Conv(c2, c2, k, s, p=k // 2, g=c2, act=False)
+        self.dw_small = Conv(c2, c2, 3, s, p=1, g=c2, act=False)
+        self.act = Conv.default_act
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply parallel depthwise downsampling during training."""
+        x = self.pw(x)
+        return self.act(self.dw_large(x) + self.dw_small(x))
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the equivalent single-branch downsampling convolution."""
+        return self.act(self.dw_reparam(self.pw(x)))
+
+    @staticmethod
+    def _fuse_branch(branch: Conv) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse one Conv-BN depthwise branch into a kernel and bias."""
+        conv, bn = branch.conv, branch.bn
+        std = torch.sqrt(bn.running_var + bn.eps)
+        scale = (bn.weight / std).reshape(-1, 1, 1, 1)
+        kernel = conv.weight * scale
+        bias = bn.bias - bn.running_mean * bn.weight / std
+        return kernel, bias
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the fused large kernel and bias for deployment."""
+        kernel_large, bias_large = self._fuse_branch(self.dw_large)
+        kernel_small, bias_small = self._fuse_branch(self.dw_small)
+        pad = (self.k - 3) // 2
+        kernel_small = F.pad(kernel_small, [pad, pad, pad, pad])
+        return kernel_large + kernel_small, bias_large + bias_small
+
+    def fuse_convs(self) -> None:
+        """Merge the parallel depthwise branches into one large-kernel convolution."""
+        if hasattr(self, "dw_reparam"):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.dw_reparam = nn.Conv2d(
+            self.c2,
+            self.c2,
+            self.k,
+            self.s,
+            self.k // 2,
+            groups=self.c2,
+            bias=True,
+        ).to(kernel.device, kernel.dtype)
+        self.dw_reparam.weight.data.copy_(kernel)
+        self.dw_reparam.bias.data.copy_(bias)
+        del self.dw_large
+        del self.dw_small
 
 
 class SCDown(nn.Module):

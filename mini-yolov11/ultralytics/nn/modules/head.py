@@ -27,14 +27,17 @@ __all__ = (
     "Detect",
     "DyHeadLiteDetect",
     "ESEDetect",
+    "ETHeadLiteDetect",
     "GhostHeadDetect",
     "LEDHDetect",
     "OAHeadLiteDetect",
     "Pose",
+    "RTMDetSepBNDetect",
     "RTDETRDecoder",
     "Segment",
     "SemanticSegment",
     "THeadLiteDetect",
+    "THeadLiteDirectDetect",
     "TSCODECrossScaleLiteDetect",
     "TSCODELiteDetect",
     "YOLOEDetect",
@@ -743,6 +746,56 @@ class ESEDetect(Detect):
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
 
+class _ETHeadLiteStem(nn.Module):
+    """PP-YOLOE-style task stem with a lightweight channel bottleneck and ESE calibration."""
+
+    def __init__(self, in_channels: int, hidden: int):
+        """Build one classification or regression task-specific ESE stem."""
+        super().__init__()
+        self.reduce = Conv(in_channels, hidden, 1)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Conv2d(hidden, hidden, 1)
+        self.project = Conv(hidden, hidden, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Select task-relevant channels and transform the calibrated feature."""
+        x = self.reduce(x)
+        weight = self.fc(self.avg_pool(x)).sigmoid()
+        return self.project(x * weight)
+
+
+class ETHeadLiteDetect(Detect):
+    """Lightweight PP-YOLOE Efficient Task-aligned detection head for YOLO11.
+
+    Each pyramid level has separate ESE-calibrated classification and regression
+    stems. A single 3x3 prediction layer follows each stem, replacing YOLO11's
+    deeper prediction towers while retaining the native DFL decoder and TAL loss.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden: int = 64,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize task-specific ESE stems and single-layer predictors."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = max(int(hidden), self.reg_max * 4, 16)
+        hidden = (hidden + 7) // 8 * 8
+        self.hidden = hidden
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(_ETHeadLiteStem(c, hidden), nn.Conv2d(hidden, 4 * self.reg_max, 3, padding=1))
+            for c in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(_ETHeadLiteStem(c, hidden), nn.Conv2d(hidden, self.nc, 3, padding=1)) for c in ch
+        )
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
 
 class _THeadLiteConv(nn.Module):
     """Scale-stable depthwise-separable interaction layer for T-Head-Lite."""
@@ -859,6 +912,203 @@ class THeadLiteDetect(Detect):
         if self.end2end:
             x_detach = [feature.detach() for feature in x]
             one2one = self._forward_aligned(x_detach, **self.one2one)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+
+class THeadLiteDirectDetect(Detect):
+    """TOOD-style task-aligned head with direct lightweight DFL and class predictors.
+
+    Unlike :class:`THeadLiteDetect`, aligned hidden features are not restored to
+    the original pyramid channels and passed through the complete YOLO Detect
+    towers. They are predicted directly, removing duplicated feature extraction.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        num_layers: int = 3,
+        hidden: int = 64,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize shared interaction layers, task decomposition, and direct predictors."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = max(int(hidden), self.reg_max * 4, 16)
+        hidden = (hidden + 7) // 8 * 8
+        num_layers = max(int(num_layers), 1)
+        self.hidden = hidden
+        self.task_lateral = nn.ModuleList(Conv(c, hidden, 1) if c != hidden else nn.Identity() for c in ch)
+        self.interaction_layers = nn.ModuleList(_THeadLiteConv(hidden) for _ in range(num_layers))
+        self.cls_decomposition = _TaskDecompositionLite(hidden, num_layers)
+        self.box_decomposition = _TaskDecompositionLite(hidden, num_layers)
+        self.cls_scale = nn.Parameter(torch.full((self.nl,), 0.1))
+        self.box_scale = nn.Parameter(torch.full((self.nl,), 0.1))
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(nn.Conv2d(hidden, 4 * self.reg_max, 3, padding=1)) for _ in ch
+        )
+        self.cv3 = nn.ModuleList(nn.Sequential(nn.Conv2d(hidden, self.nc, 3, padding=1)) for _ in ch)
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def _direct_features(self, x: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Build residual task-aligned hidden features without restoring pyramid channels."""
+        cls_features, box_features = [], []
+        for level, feature in enumerate(x):
+            base = self.task_lateral[level](feature)
+            y = base
+            interaction_features = []
+            for layer in self.interaction_layers:
+                y = layer(y)
+                interaction_features.append(y)
+            cls_task = self.cls_decomposition(interaction_features)
+            box_task = self.box_decomposition(interaction_features)
+            cls_features.append(base + self.cls_scale[level] * cls_task)
+            box_features.append(base + self.box_scale[level] * box_task)
+        return cls_features, box_features
+
+    def _forward_direct(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Predict boxes and classes directly from aligned hidden features."""
+        cls_features, box_features = self._direct_features(x)
+        bs = x[0].shape[0]
+        boxes = torch.cat(
+            [box_head[i](box_features[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+        )
+        scores = torch.cat([cls_head[i](cls_features[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        return dict(boxes=boxes, scores=scores, feats=box_features)
+
+    def forward(self, x: list[torch.Tensor]):
+        """Run task alignment followed by direct prediction."""
+        preds = self._forward_direct(x, **self.one2many)
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self._forward_direct(x_detach, **self.one2one)
+            preds = {"one2many": preds, "one2one": one2one}
+        if self.training:
+            return preds
+        y = self._inference(preds["one2one"] if self.end2end else preds)
+        if self.end2end:
+            y = self.postprocess(y.permute(0, 2, 1))
+        return y if self.export else (y, preds)
+
+
+class _RTMDetSepBNTower(nn.Module):
+    """RTMDet tower with shared convolution weights and scale-specific BatchNorm."""
+
+    def __init__(self, channels: int, num_levels: int, stacked_convs: int = 2, use_depthwise: bool = True):
+        """Create shared spatial convolutions and independent normalization for every pyramid level."""
+        super().__init__()
+        self.use_depthwise = bool(use_depthwise)
+        self.shared_spatial = nn.ModuleList(
+            nn.Conv2d(
+                channels,
+                channels,
+                3,
+                padding=1,
+                groups=channels if self.use_depthwise else 1,
+                bias=False,
+            )
+            for _ in range(stacked_convs)
+        )
+        self.spatial_bn = nn.ModuleList(
+            nn.ModuleList(nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03) for _ in range(num_levels))
+            for _ in range(stacked_convs)
+        )
+        self.shared_pointwise = (
+            nn.ModuleList(nn.Conv2d(channels, channels, 1, bias=False) for _ in range(stacked_convs))
+            if self.use_depthwise
+            else None
+        )
+        self.pointwise_bn = (
+            nn.ModuleList(
+                nn.ModuleList(nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03) for _ in range(num_levels))
+                for _ in range(stacked_convs)
+            )
+            if self.use_depthwise
+            else None
+        )
+        self.act = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor, level: int) -> torch.Tensor:
+        """Apply shared convolutions with normalization selected for one pyramid level."""
+        for i, conv in enumerate(self.shared_spatial):
+            x = self.act(self.spatial_bn[i][level](conv(x)))
+            if self.use_depthwise:
+                x = self.act(self.pointwise_bn[i][level](self.shared_pointwise[i](x)))
+        return x
+
+
+class RTMDetSepBNDetect(Detect):
+    """YOLO-compatible RTMDet SepBN head with shared task-tower convolutions.
+
+    P3/P4/P5 are projected to a common width. Classification and regression
+    towers remain decoupled; convolution weights are shared across scales while
+    every scale keeps independent BatchNorm and output prediction layers.
+    """
+
+    def __init__(
+        self,
+        nc: int = 80,
+        hidden: int = 64,
+        stacked_convs: int = 2,
+        use_depthwise: bool = True,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+    ):
+        """Initialize channel adapters, SepBN shared towers, and YOLO DFL predictors."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = max(int(hidden), self.reg_max * 4, 16)
+        hidden = (hidden + 7) // 8 * 8
+        stacked_convs = max(int(stacked_convs), 1)
+        self.hidden = hidden
+        self.adapters = nn.ModuleList(Conv(c, hidden, 1) if c != hidden else nn.Identity() for c in ch)
+        self.cls_tower = _RTMDetSepBNTower(hidden, self.nl, stacked_convs, use_depthwise)
+        self.box_tower = _RTMDetSepBNTower(hidden, self.nl, stacked_convs, use_depthwise)
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(nn.Conv2d(hidden, 4 * self.reg_max, 1)) for _ in ch
+        )
+        self.cv3 = nn.ModuleList(nn.Sequential(nn.Conv2d(hidden, self.nc, 1)) for _ in ch)
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def _forward_sepbn(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module,
+        cls_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Predict with shared convolutions and scale-specific normalization."""
+        bs = x[0].shape[0]
+        box_features, boxes, scores = [], [], []
+        for level, feature in enumerate(x):
+            feature = self.adapters[level](feature)
+            cls_feature = self.cls_tower(feature, level)
+            box_feature = self.box_tower(feature, level)
+            box_features.append(box_feature)
+            boxes.append(box_head[level](box_feature).view(bs, 4 * self.reg_max, -1))
+            scores.append(cls_head[level](cls_feature).view(bs, self.nc, -1))
+        return dict(boxes=torch.cat(boxes, dim=-1), scores=torch.cat(scores, dim=-1), feats=box_features)
+
+    def forward(self, x: list[torch.Tensor]):
+        """Run RTMDet SepBN shared towers and standard YOLO decoding."""
+        preds = self._forward_sepbn(x, **self.one2many)
+        if self.end2end:
+            x_detach = [feature.detach() for feature in x]
+            one2one = self._forward_sepbn(x_detach, **self.one2one)
             preds = {"one2many": preds, "one2one": one2one}
         if self.training:
             return preds
