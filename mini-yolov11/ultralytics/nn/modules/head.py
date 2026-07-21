@@ -35,6 +35,7 @@ __all__ = (
     "Segment",
     "SemanticSegment",
     "THeadLiteDetect",
+    "TSCODECrossScaleLiteDetect",
     "TSCODELiteDetect",
     "YOLOEDetect",
     "YOLOESegment",
@@ -492,6 +493,140 @@ class TSCODELiteDetect(Detect):
         if end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+
+class _SemanticContextEncodingLite(nn.Module):
+    """Paper-faithful SCE routing with lightweight feature projection."""
+
+    def __init__(self, current_channels: int, deeper_channels: int | None, hidden: int):
+        """Build DConv(P_l) + P_(l+1) semantic encoding for classification."""
+        super().__init__()
+        self.has_deeper = deeper_channels is not None
+        if self.has_deeper:
+            self.current_down = Conv(current_channels, hidden, 3, 2)
+            self.deeper_project = Conv(deeper_channels, hidden, 1)
+            self.fuse = nn.Sequential(DWConv(hidden * 2, hidden * 2, 3), Conv(hidden * 2, hidden, 1))
+        else:
+            # P5 is already the deepest prediction level, so no artificial P6 feature is introduced.
+            self.current_project = nn.Sequential(Conv(current_channels, hidden, 1), DWConv(hidden, hidden, 3))
+
+    def forward(self, current: torch.Tensor, deeper: torch.Tensor | None = None) -> torch.Tensor:
+        """Return a semantically stronger classification feature at the current resolution."""
+        if not self.has_deeper:
+            return self.current_project(current)
+        coarse = self.current_down(current)
+        semantic = self.deeper_project(deeper)
+        if semantic.shape[2:] != coarse.shape[2:]:
+            semantic = F.interpolate(semantic, size=coarse.shape[2:], mode="nearest")
+        coarse = self.fuse(torch.cat((coarse, semantic), dim=1))
+        return F.interpolate(coarse, size=current.shape[2:], mode="nearest")
+
+
+class _DetailPreservingEncodingLite(nn.Module):
+    """Paper-faithful DPE routing over adjacent pyramid levels for localization."""
+
+    def __init__(
+        self,
+        current_channels: int,
+        shallower_channels: int | None,
+        deeper_channels: int | None,
+        hidden: int,
+    ):
+        """Build the adjacent-level detail-preserving localization encoder."""
+        super().__init__()
+        self.has_shallower = shallower_channels is not None
+        self.has_deeper = deeper_channels is not None
+        self.current_project = Conv(current_channels, hidden, 1)
+        if self.has_shallower:
+            self.shallower_down = Conv(shallower_channels, hidden, 3, 2)
+        if self.has_deeper:
+            self.deeper_project = Conv(deeper_channels, hidden, 1)
+        branches = 1 + int(self.has_shallower) + int(self.has_deeper)
+        self.fuse = nn.Sequential(DWConv(hidden * branches, hidden * branches, 3), Conv(hidden * branches, hidden, 1))
+
+    def forward(
+        self,
+        current: torch.Tensor,
+        shallower: torch.Tensor | None = None,
+        deeper: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fuse current semantics with high-resolution details and adjacent deep context."""
+        target_size = current.shape[2:]
+        features = [self.current_project(current)]
+        if self.has_shallower:
+            detail = self.shallower_down(shallower)
+            if detail.shape[2:] != target_size:
+                detail = F.interpolate(detail, size=target_size, mode="nearest")
+            features.insert(0, detail)
+        if self.has_deeper:
+            semantic = self.deeper_project(deeper)
+            semantic = F.interpolate(semantic, size=target_size, mode="nearest")
+            features.append(semantic)
+        return self.fuse(torch.cat(features, dim=1))
+
+
+class TSCODECrossScaleLiteDetect(Detect):
+    """YOLO head with cross-scale SCE and DPE feature routing from the TSCODE paper.
+
+    Classification uses DConv(P_l) concatenated with P_(l+1) to obtain spatially coarse,
+    semantically strong features. Localization fuses the current level with its adjacent
+    shallow and deep levels to preserve boundaries. Depthwise-separable prediction layers
+    keep the adapted head suitable for the YOLO11n compute budget.
+    """
+
+    def __init__(self, nc: int = 80, hidden: int = 64, reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize a cross-scale TSCODE-Lite detection head."""
+        super().__init__(nc, reg_max, end2end, ch)
+        hidden = max(int(hidden), 16)
+        self.sce = nn.ModuleList(
+            _SemanticContextEncodingLite(ch[i], ch[i + 1] if i + 1 < self.nl else None, hidden)
+            for i in range(self.nl)
+        )
+        self.dpe = nn.ModuleList(
+            _DetailPreservingEncodingLite(
+                ch[i],
+                ch[i - 1] if i > 0 else None,
+                ch[i + 1] if i + 1 < self.nl else None,
+                hidden,
+            )
+            for i in range(self.nl)
+        )
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(DWConv(hidden, hidden, 3), nn.Conv2d(hidden, 4 * self.reg_max, 1)) for _ in ch
+        )
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(DWConv(hidden, hidden, 3), nn.Conv2d(hidden, self.nc, 1)) for _ in ch
+        )
+
+        if end2end:
+            self.one2one_cv2 = copy.deepcopy(self.cv2)
+            self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+    def _task_features(self, x: list[torch.Tensor]) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Generate task-specific classification and localization features."""
+        cls_features, box_features = [], []
+        for i in range(self.nl):
+            shallower = x[i - 1] if i > 0 else None
+            deeper = x[i + 1] if i + 1 < self.nl else None
+            cls_features.append(self.sce[i](x[i], deeper))
+            box_features.append(self.dpe[i](x[i], shallower, deeper))
+        return cls_features, box_features
+
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module = None, cls_head: torch.nn.Module = None
+    ) -> dict[str, torch.Tensor]:
+        """Predict boxes and classes from task-specific cross-scale features."""
+        if box_head is None or cls_head is None:
+            return dict()
+        bs = x[0].shape[0]
+        cls_features, box_features = self._task_features(x)
+        boxes = torch.cat(
+            [box_head[i](box_features[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
+        )
+        scores = torch.cat(
+            [cls_head[i](cls_features[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1
+        )
+        return dict(boxes=boxes, scores=scores, feats=box_features)
 
 
 class VisibleRegionGateLite(nn.Module):
