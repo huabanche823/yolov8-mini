@@ -140,6 +140,7 @@ __all__ = (
     "RFPNLiteFuse",
     "SCDown",
     "SEAM",
+    "SNI",
     "SNIFuse2",
     "StripEnhance",
     "SFSConv",
@@ -4980,6 +4981,23 @@ class BiFPNAdd2(nn.Module):
         w = F.relu(self.w)
         w = w / (w.sum() + self.eps)
         return self.refine(w[0] * x0 + w[1] * x1)
+
+
+class SNI(nn.Module):
+    """Parameter-free soft nearest-neighbor interpolation from ECCV 2024."""
+
+    def __init__(self, up_f: int = 2):
+        """Initialize SNI with the paper's fixed ``1 / up_f**2`` attenuation."""
+        super().__init__()
+        if not isinstance(up_f, int) or up_f <= 0:
+            raise ValueError(f"SNI up_f must be a positive integer, but received {up_f!r}")
+        self.up_f = up_f
+        self.alpha = 1.0 / (up_f**2)
+        self.upsample = nn.Upsample(scale_factor=up_f, mode="nearest")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Upsample by nearest neighbor and attenuate using the fixed resolution ratio."""
+        return self.alpha * self.upsample(x)
 
 
 class SNIFuse2(nn.Module):

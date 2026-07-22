@@ -150,6 +150,7 @@ from ultralytics.nn.modules import (
     RTDETRDecoder,
     SCDown,
     SEAM,
+    SNI,
     SNIFuse2,
     Segment,
     Segment26,
