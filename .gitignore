@@ -22,7 +22,7 @@ dataset.zip
 /tests/
 /.dockerignore
 /pyproject.toml
-
+/WasteSortingv3_dataset/
 # C extensions
 *.so
 
