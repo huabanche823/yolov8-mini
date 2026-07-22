@@ -101,6 +101,7 @@ from ultralytics.nn.modules import (
     TripletAttention,
     DWRLite,
     DySample,
+    SAPAUpsample,
     ELA,
     EUCB,
     DyHeadLiteDetect,
@@ -1969,6 +1970,10 @@ def parse_model(d, ch, verbose=True):
         elif m is DySample:
             args = [ch[f], *args]
             c2 = ch[f]
+        elif m is SAPAUpsample:
+            c1 = [ch[x] for x in f]
+            args = [c1, *args]
+            c2 = c1[1]
         elif m is StripEnhance:
             args = [ch[f], *args]
             c2 = ch[f]

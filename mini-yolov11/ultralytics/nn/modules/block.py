@@ -101,6 +101,7 @@ __all__ = (
     "DSConv",
     "DWRLite",
     "DySample",
+    "SAPAUpsample",
     "ELA",
     "EUCB",
     "FusionFactor",
@@ -1974,6 +1975,116 @@ class DySample(nn.Module):
         else:
             offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
         return self._sample(x, offset)
+
+
+class SAPAUpsample(nn.Module):
+    """SAPA-G similarity-aware guided upsampling for an adjacent feature-pyramid pair.
+
+    The first input is the high-resolution encoder/lateral feature and the second
+    input is the low-resolution decoder feature to be upsampled. This follows the
+    gated-query SAPA formulation while providing a portable PyTorch fallback for
+    the paper's optional custom CUDA operators.
+    """
+
+    def __init__(
+        self,
+        channels: list[int] | tuple[int, int],
+        scale: int = 2,
+        kernel_size: int = 5,
+        embedding_dim: int = 32,
+        q_mode: str = "gate",
+    ):
+        """Initialize encoder-guided similarity-aware point affiliation."""
+        super().__init__()
+        if len(channels) != 2:
+            raise ValueError("SAPAUpsample expects [encoder_channels, decoder_channels]")
+        encoder_channels, decoder_channels = (int(c) for c in channels)
+        if scale < 1:
+            raise ValueError(f"SAPA scale must be positive, got {scale}")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError(f"SAPA kernel_size must be a positive odd number, got {kernel_size}")
+
+        self.scale = int(scale)
+        self.kernel_size = int(kernel_size)
+        self.embedding_dim = max(int(embedding_dim), 8)
+        self.q_mode = str(q_mode).lower()
+        if self.q_mode not in {"basic", "gate"}:
+            raise ValueError(f"SAPA q_mode must be 'basic' or 'gate', got {q_mode}")
+
+        self.norm_encoder = nn.LayerNorm(encoder_channels)
+        self.norm_decoder = nn.LayerNorm(decoder_channels)
+        if self.q_mode == "gate":
+            self.q_encoder = nn.Linear(encoder_channels, self.embedding_dim, bias=True)
+            self.q_decoder = nn.Linear(decoder_channels, self.embedding_dim, bias=True)
+            self.query_gate = nn.Linear(decoder_channels, 1, bias=True)
+        else:
+            self.q = nn.Linear(encoder_channels, self.embedding_dim, bias=True)
+        self.k = nn.Linear(decoder_channels, self.embedding_dim, bias=True)
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        """Use the initialization from the official SAPA implementation."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.trunc_normal_(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _nearest_channels_last(x: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+        """Nearest-neighbor resize an NHWC tensor and keep channels last."""
+        return F.interpolate(x.permute(0, 3, 1, 2), size=size, mode="nearest").permute(0, 2, 3, 1)
+
+    def _attention_pytorch(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Apply SAPA point affiliation using portable PyTorch tensor operators."""
+        b, high_h, high_w, _ = q.shape
+        _, low_h, low_w, channels = v.shape
+        expected_size = (low_h * self.scale, low_w * self.scale)
+        if (high_h, high_w) != expected_size:
+            raise ValueError(
+                f"SAPA encoder size {(high_h, high_w)} must equal decoder size {(low_h, low_w)} "
+                f"times scale={self.scale}"
+            )
+
+        q_subpixels = F.pixel_unshuffle(q.permute(0, 3, 1, 2), self.scale).reshape(
+            b, self.embedding_dim, self.scale**2, low_h, low_w
+        )
+        key_patches = F.unfold(
+            k.permute(0, 3, 1, 2),
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+        ).reshape(b, self.embedding_dim, self.kernel_size**2, low_h, low_w)
+        logits = torch.einsum("bdphw,bdkhw->bpkhw", q_subpixels, key_patches)
+        attention = logits.softmax(dim=2)
+
+        value_patches = F.unfold(
+            v.permute(0, 3, 1, 2),
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+        ).reshape(b, channels, self.kernel_size**2, low_h, low_w)
+        output = torch.einsum("bpkhw,bckhw->bcphw", attention, value_patches)
+        return F.pixel_shuffle(output.reshape(b, channels * self.scale**2, low_h, low_w), self.scale)
+
+    def forward(self, x: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """Upsample the decoder feature using the high-resolution encoder feature as guidance."""
+        encoder, decoder = x
+        encoder_nhwc = encoder.permute(0, 2, 3, 1).contiguous()
+        decoder_nhwc = decoder.permute(0, 2, 3, 1).contiguous()
+        encoder_norm = self.norm_encoder(encoder_nhwc)
+        decoder_norm = self.norm_decoder(decoder_nhwc)
+
+        if self.q_mode == "gate":
+            target_size = encoder.shape[-2:]
+            gate = self._nearest_channels_last(self.query_gate(decoder_norm).sigmoid(), target_size)
+            decoder_high = self._nearest_channels_last(decoder_nhwc, target_size)
+            q = gate * self.q_encoder(encoder_norm) + (1.0 - gate) * self.q_decoder(decoder_high)
+        else:
+            q = self.q(encoder_norm)
+        k = self.k(decoder_norm)
+        return self._attention_pytorch(q, k, decoder_nhwc)
 
 
 class MSBlock(nn.Module):
