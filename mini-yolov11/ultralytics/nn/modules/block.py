@@ -68,7 +68,9 @@ __all__ = (
     "C3k2_MobileOneLite",
     "C3k2_HorNetResidual",
     "C3k2_MogaResidual",
+    "C3k2_GhostV2DFC",
     "C3k2_MSBlock",
+    "C3k2_MSBlockLite",
     "C3k2_RFAConv",
     "C3k2_RepHELANLite",
     "C3k2_RepHMSLite",
@@ -113,6 +115,8 @@ __all__ = (
     "MobileViTv2SSA",
     "GCConv",
     "GhostBottleneck",
+    "GhostBottleneckV2DFC",
+    "GhostModuleV2DFC",
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
@@ -122,6 +126,7 @@ __all__ = (
     "GnConvLite",
     "MogaBlockLite",
     "MSBlock",
+    "HierarchicalMSBlockLite",
     "ODConv",
     "Proto",
     "RFAConv",
@@ -728,6 +733,78 @@ class GhostBottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply skip connection and addition to input tensor."""
         return self.conv(x) + self.shortcut(x)
+
+
+class GhostModuleV2DFC(nn.Module):
+    """GhostNetV2 module with decoupled fully-connected spatial attention.
+
+    The attention path follows the official GhostNetV2 implementation: it is
+    evaluated at half resolution and uses depthwise 1x5 followed by 5x1
+    convolutions to obtain a hardware-friendly long-range spatial gate.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int = 1,
+        s: int = 1,
+        ratio: int = 2,
+        dw_k: int = 3,
+        act: bool = True,
+        attention: bool = False,
+    ):
+        """Initialize a GhostNetV2 feature generator."""
+        super().__init__()
+        if ratio < 2:
+            raise ValueError(f"GhostModuleV2DFC ratio must be at least 2, got {ratio}")
+        primary_channels = math.ceil(c2 / ratio)
+        cheap_channels = primary_channels * (ratio - 1)
+        self.c2 = c2
+        self.attention = attention
+        self.primary = Conv(c1, primary_channels, k, s, act=nn.ReLU(inplace=True) if act else False)
+        self.cheap = Conv(
+            primary_channels,
+            cheap_channels,
+            dw_k,
+            1,
+            g=primary_channels,
+            act=nn.ReLU(inplace=True) if act else False,
+        )
+        if attention:
+            self.dfc = nn.Sequential(
+                Conv(c1, c2, k, s, act=False),
+                Conv(c2, c2, (1, 5), 1, g=c2, act=False),
+                Conv(c2, c2, (5, 1), 1, g=c2, act=False),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Generate intrinsic and cheap features, optionally gated by DFC attention."""
+        primary = self.primary(x)
+        out = torch.cat((primary, self.cheap(primary)), dim=1)[:, : self.c2]
+        if not self.attention:
+            return out
+        gate_input = F.avg_pool2d(x, kernel_size=2, stride=2)
+        gate = torch.sigmoid(self.dfc(gate_input))
+        gate = F.interpolate(gate, size=out.shape[-2:], mode="nearest")
+        return out * gate
+
+
+class GhostBottleneckV2DFC(nn.Module):
+    """Stride-one GhostNetV2 bottleneck adapted for CSP neck feature refinement."""
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, expansion: float = 2.0):
+        """Initialize GhostNetV2 expansion, DFC attention, and projection paths."""
+        super().__init__()
+        hidden = max(c2, int(c2 * expansion))
+        self.ghost1 = GhostModuleV2DFC(c1, hidden, act=True, attention=True)
+        self.ghost2 = GhostModuleV2DFC(hidden, c2, act=False, attention=False)
+        self.shortcut = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the GhostNetV2 bottleneck with an optional residual connection."""
+        y = self.ghost2(self.ghost1(x))
+        return x + y if self.shortcut else y
 
 
 class Bottleneck(nn.Module):
@@ -2121,6 +2198,67 @@ class MSBlock(nn.Module):
         return self.fuse(torch.cat(y, dim=1)) + x
 
 
+class _MSBlockLiteLayer(nn.Module):
+    """Light inverted depthwise layer used inside a hierarchical MSBlock branch."""
+
+    def __init__(self, channels: int, kernel_size: int, expansion: float = 2.0):
+        """Initialize an expansion, depthwise filtering, and projection sequence."""
+        super().__init__()
+        hidden = max(channels, int(channels * expansion))
+        self.expand = Conv(channels, hidden, 1, 1)
+        self.depthwise = Conv(hidden, hidden, kernel_size, 1, g=hidden)
+        self.project = Conv(hidden, channels, 1, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply lightweight spatial refinement with a residual connection."""
+        return x + self.project(self.depthwise(self.expand(x)))
+
+
+class HierarchicalMSBlockLite(nn.Module):
+    """Lite MSBlock with the hierarchical branch communication used by YOLO-MS.
+
+    Channels are split into equal groups. Starting from the second group, each
+    branch first receives the preceding branch output and then applies its own
+    spatial kernel. This differs from the older parallel-only ``MSBlock`` in
+    this project while retaining a compact single-layer branch design.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int | None = None,
+        kernels: tuple[int, ...] = (1, 3, 5),
+        expansion: float = 2.0,
+        shortcut: bool = True,
+    ):
+        """Initialize hierarchical multi-scale branches and feature projections."""
+        super().__init__()
+        c2 = c1 if c2 is None else c2
+        if len(kernels) < 2:
+            raise ValueError("HierarchicalMSBlockLite requires at least two kernel branches")
+        branch_channels = math.ceil(c2 / len(kernels))
+        inner_channels = branch_channels * len(kernels)
+        self.branch_channels = branch_channels
+        self.in_proj = Conv(c1, inner_channels, 1, 1)
+        self.branches = nn.ModuleList(
+            nn.Identity() if kernel_size == 1 else _MSBlockLiteLayer(branch_channels, kernel_size, expansion)
+            for kernel_size in kernels
+        )
+        self.out_proj = Conv(inner_channels, c2, 1, 1)
+        self.shortcut = shortcut and c1 == c2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Propagate features progressively across increasing receptive-field branches."""
+        parts = torch.split(self.in_proj(x), self.branch_channels, dim=1)
+        outputs: list[torch.Tensor] = []
+        for i, (part, branch) in enumerate(zip(parts, self.branches)):
+            if i:
+                part = part + outputs[-1]
+            outputs.append(branch(part))
+        y = self.out_proj(torch.cat(outputs, dim=1))
+        return x + y if self.shortcut else y
+
+
 class GCBlock(nn.Module):
     """Global context block for lightweight context-guided feature recalibration."""
 
@@ -3389,6 +3527,54 @@ class C3k2_DDFM(C3k2):
             C3k_DDFM(self.c, self.c, 2, shortcut, g)
             if c3k
             else Bottleneck_DDFM(self.c, self.c, shortcut, g, e=1.0)
+            for _ in range(n)
+        )
+
+
+class C3k2_GhostV2DFC(C3k2):
+    """C3k2 variant with GhostNetV2 DFC bottlenecks for lightweight spatial context."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize a C3k2-compatible GhostNetV2 DFC block."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_GhostV2DFC(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else GhostBottleneckV2DFC(self.c, self.c, shortcut)
+            for _ in range(n)
+        )
+
+
+class C3k2_MSBlockLite(C3k2):
+    """C3k2 variant using hierarchical lightweight MSBlock feature refinement."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        c3k: bool = False,
+        e: float = 0.5,
+        attn: bool = False,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        """Initialize a C3k2-compatible hierarchical MSBlock-Lite block."""
+        super().__init__(c1, c2, n, c3k, e, attn, g, shortcut)
+        self.m = nn.ModuleList(
+            C3k_MSBlockLite(self.c, self.c, 2, shortcut, g)
+            if c3k
+            else HierarchicalMSBlockLite(self.c, self.c, shortcut=shortcut)
             for _ in range(n)
         )
 
@@ -5348,6 +5534,26 @@ class C3k_DDFM(C3):
         super().__init__(c1, c2, n, shortcut, g, e)
         c_ = int(c2 * e)
         self.m = nn.Sequential(*(Bottleneck_DDFM(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+
+class C3k_GhostV2DFC(C3):
+    """C3k block using GhostNetV2 DFC bottlenecks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize GhostNetV2 DFC bottlenecks inside a C3 container."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(GhostBottleneckV2DFC(c_, c_, shortcut) for _ in range(n)))
+
+
+class C3k_MSBlockLite(C3):
+    """C3k block using hierarchical lightweight MSBlocks."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True, g: int = 1, e: float = 0.5):
+        """Initialize hierarchical MSBlock-Lite layers inside a C3 container."""
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)
+        self.m = nn.Sequential(*(HierarchicalMSBlockLite(c_, c_, shortcut=shortcut) for _ in range(n)))
 
 
 class C3k_MSBlock(C3):
