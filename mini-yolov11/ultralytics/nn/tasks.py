@@ -129,6 +129,7 @@ from ultralytics.nn.modules import (
     GhostConv,
     HGBlock,
     HGStem,
+    IBEDown,
     ImagePoolingAttn,
     Index,
     LRPCHead,
@@ -343,6 +344,9 @@ class BaseModel(torch.nn.Module):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepDown):
+                    m.fuse_convs()
+                    m.forward = m.forward_fuse
+                if isinstance(m, IBEDown):
                     m.fuse_convs()
                     m.forward = m.forward_fuse
                 if isinstance(m, RepVGGDW):
@@ -1831,6 +1835,7 @@ def parse_model(d, ch, verbose=True):
             PConvFasterC3k2,
             WTConvDown,
             RepDown,
+            IBEDown,
             RepNCSPELAN4,
             ELAN1,
             ADown,

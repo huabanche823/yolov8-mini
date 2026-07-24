@@ -120,6 +120,7 @@ __all__ = (
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
+    "IBEDown",
     "LSKBlock",
     "LineRefineLite",
     "MFAM",
@@ -6055,6 +6056,81 @@ class RepDown(nn.Module):
         self.dw_reparam.bias.data.copy_(bias)
         del self.dw_large
         del self.dw_small
+
+
+class IBEDown(nn.Module):
+    """FemtoDet IBE depthwise-separable downsampling adapted for the YOLO neck.
+
+    IBE reuses the learnable 3x3 kernel to form a center-difference descriptor:
+    the spatially summed kernel is applied as a 1x1 convolution and subtracted
+    from the normal response with a learnable sigmoid gate. Independent BNs
+    align the normal and boundary-enhanced paths. Both paths are exactly merged
+    into one depthwise 3x3 convolution for deployment.
+    """
+
+    def __init__(self, c1: int, c2: int, s: int = 2, theta_init: float = 0.0):
+        """Initialize the IBE depthwise operator and linear pointwise projection."""
+        super().__init__()
+        if s not in {1, 2}:
+            raise ValueError(f"IBEDown stride must be 1 or 2, got {s}")
+        self.c1 = c1
+        self.c2 = c2
+        self.s = s
+        self.dw = nn.Conv2d(c1, c1, 3, s, 1, groups=c1, bias=False)
+        self.bn_normal = nn.BatchNorm2d(c1)
+        self.bn_boundary = nn.BatchNorm2d(c1)
+        self.theta = nn.Parameter(torch.tensor([float(theta_init)]))
+        self.act = Conv.default_act
+        self.project = Conv(c1, c2, 1, 1, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the official IBE normal and kernel-reused difference paths."""
+        normal = self.dw(x)
+        kernel_diff = self.dw.weight.sum((2, 3), keepdim=True)
+        difference = F.conv2d(x, kernel_diff, stride=self.s, groups=self.c1)
+        boundary = normal - self.theta.sigmoid() * difference
+        return self.project(self.act(self.bn_normal(normal) + self.bn_boundary(boundary)))
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the equivalent single depthwise branch after deployment fusion."""
+        return self.project(self.act(self.dw_reparam(x)))
+
+    @staticmethod
+    def _fuse_kernel_bn(kernel: torch.Tensor, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fuse one convolution kernel and BatchNorm into a kernel and bias."""
+        std = torch.sqrt(bn.running_var + bn.eps)
+        scale = (bn.weight / std).reshape(-1, 1, 1, 1)
+        return kernel * scale, bn.bias - bn.running_mean * bn.weight / std
+
+    def get_equivalent_kernel_bias(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the official IBE normal-plus-difference equivalent kernel."""
+        kernel_normal = self.dw.weight
+        kernel_sum = kernel_normal.sum((2, 3), keepdim=True)
+        kernel_boundary = kernel_normal - F.pad(self.theta.sigmoid() * kernel_sum, [1, 1, 1, 1])
+        kernel_normal, bias_normal = self._fuse_kernel_bn(kernel_normal, self.bn_normal)
+        kernel_boundary, bias_boundary = self._fuse_kernel_bn(kernel_boundary, self.bn_boundary)
+        return kernel_normal + kernel_boundary, bias_normal + bias_boundary
+
+    def fuse_convs(self) -> None:
+        """Merge the official IBE paths into one depthwise convolution."""
+        if hasattr(self, "dw_reparam"):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.dw_reparam = nn.Conv2d(
+            self.c1,
+            self.c1,
+            3,
+            self.s,
+            1,
+            groups=self.c1,
+            bias=True,
+        ).to(kernel.device, kernel.dtype)
+        self.dw_reparam.weight.data.copy_(kernel)
+        self.dw_reparam.bias.data.copy_(bias)
+        del self.dw
+        del self.bn_normal
+        del self.bn_boundary
+        del self.theta
 
 
 class SCDown(nn.Module):
